@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 
@@ -75,6 +76,55 @@ class InvertedIndex:
         hits = set.intersection(*sets) if sets else set()
         return [{"id": doc_id, "matched": sum(1 for term in wanted if doc_id in postings.get(term, {}))}
                 for doc_id in sorted(hits, key=lambda value: (-sum(1 for t in wanted if value in postings.get(t, {})), value))]
+
+    def _snapshot(self) -> dict:
+        """Read and fully validate the persisted snapshot; every defect raises ValueError."""
+        document = self._read()
+        if not isinstance(document, dict):
+            raise ValueError("index snapshot must be a JSON object")
+        documents = document.get("documents")
+        postings = document.get("postings")
+        if not isinstance(documents, dict):
+            raise ValueError("index snapshot documents must be an object")
+        if not isinstance(postings, dict):
+            raise ValueError("index snapshot postings must be an object")
+        for doc_id, text in documents.items():
+            if not isinstance(doc_id, str) or not isinstance(text, str):
+                raise ValueError("document ids and texts must be strings")
+        for term, entries in postings.items():
+            if not isinstance(term, str):
+                raise ValueError("posting terms must be strings")
+            if not isinstance(entries, dict):
+                raise ValueError("posting entries must be objects")
+            for doc_id, tf in entries.items():
+                if not isinstance(doc_id, str):
+                    raise ValueError("posting document ids must be strings")
+                if not isinstance(tf, int) or isinstance(tf, bool) or tf < 0:
+                    raise ValueError("term frequencies must be non-negative integers")
+        return document
+
+    def rank(self, terms: list[str]) -> list[dict]:
+        """Score documents with (1+ln(tf))*idf summed over the de-duplicated query terms."""
+        if not terms or any(not isinstance(term, str) for term in terms):
+            raise ValueError("rank needs a non-empty list of string terms")
+        wanted = sorted({term.lower() for term in terms})
+        snapshot = self._snapshot()
+        total = len(snapshot["documents"])
+        postings = snapshot["postings"]
+        hits: dict[str, dict] = {}
+        for term in wanted:
+            entries = postings.get(term)
+            if not entries:
+                continue
+            idf = math.log((1 + total) / (1 + len(entries))) + 1.0
+            for doc_id, tf in entries.items():
+                hit = hits.setdefault(doc_id, {"matched": 0, "score": 0.0})
+                hit["matched"] += 1
+                hit["score"] += (1.0 + math.log(tf)) * idf if tf > 0 else 0.0
+        ranked = [{"id": doc_id, "matched": hit["matched"], "score": round(hit["score"], 6)}
+                  for doc_id, hit in hits.items()]
+        ranked.sort(key=lambda item: (-item["score"], item["id"]))
+        return ranked
 
     def terms(self) -> list[str]:
         return sorted(self._read()["postings"])
