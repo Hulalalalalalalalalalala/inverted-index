@@ -52,6 +52,7 @@ def _parser() -> argparse.ArgumentParser:
     get = sub.add_parser("get"); get.add_argument("doc_id")
     delete = sub.add_parser("delete"); delete.add_argument("doc_id")
     query = sub.add_parser("query"); query.add_argument("terms", nargs="+")
+    rank = sub.add_parser("rank", help="score documents against terms"); rank.add_argument("terms", nargs="+")
     sub.add_parser("terms", help="list every term")
     sub.add_parser("stats", help="print document, term and posting counts")
     sub.add_parser("reload", help="reload the index snapshot")
@@ -61,7 +62,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    store = InvertedIndex(args.root)
+    index = InvertedIndex(args.root)
     try:
         if args.command == "init":
             index.init(); print(f"initialised {index.path}")
@@ -73,6 +74,12 @@ def main(argv: list[str] | None = None) -> int:
             print("true" if index.delete(args.doc_id) else "false")
         elif args.command == "query":
             print(json.dumps(index.query(args.terms), ensure_ascii=False))
+        elif args.command == "rank":
+            try:
+                print(json.dumps(index.rank(args.terms), ensure_ascii=False))
+            except ValueError as error:
+                print(f"error: {error}", file=sys.stderr)
+                return 1
         elif args.command == "terms":
             print(json.dumps(index.terms()))
         elif args.command == "stats":
@@ -80,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "reload":
             index.reload(); print("ok")
         elif args.command == "report":
-            print(_report(["postings", "tokenizer"], {"add": True, "query": True, "delete": True, "ranking": False}))
+            print(_report(["postings", "tokenizer"], {"add": True, "query": True, "delete": True, "ranking": True}))
         return 0
     except FileNotFoundError as error:
         print(f"error: {error}", file=sys.stderr)

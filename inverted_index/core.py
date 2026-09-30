@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 
@@ -75,6 +76,53 @@ class InvertedIndex:
         hits = set.intersection(*sets) if sets else set()
         return [{"id": doc_id, "matched": sum(1 for term in wanted if doc_id in postings.get(term, {}))}
                 for doc_id in sorted(hits, key=lambda value: (-sum(1 for t in wanted if value in postings.get(t, {})), value))]
+
+    def _snapshot(self) -> dict:
+        """Read the persisted snapshot and validate its shape and field types."""
+        if not self.path.is_file():
+            raise FileNotFoundError(f"no index at {self.path}; run init first")
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            raise ValueError(f"invalid index at {self.path}: {error}") from error
+        if not isinstance(data, dict):
+            raise ValueError("index snapshot must be a JSON object")
+        documents, postings = data.get("documents"), data.get("postings")
+        if not isinstance(documents, dict) or not isinstance(postings, dict):
+            raise ValueError("index snapshot needs object 'documents' and 'postings'")
+        for doc_id, text in documents.items():
+            if not isinstance(doc_id, str) or not isinstance(text, str):
+                raise ValueError("document ids and texts must be strings")
+        for term, entries in postings.items():
+            if not isinstance(term, str) or not isinstance(entries, dict):
+                raise ValueError("postings must map string terms to per-document objects")
+            for doc_id, tf in entries.items():
+                if not isinstance(doc_id, str) or isinstance(tf, bool) or not isinstance(tf, int) or tf < 0:
+                    raise ValueError("posting frequencies must be non-negative integers")
+        return data
+
+    def rank(self, terms: list[str]) -> list[dict]:
+        """Score documents against ``terms`` with a tf-idf sum, best first."""
+        if not terms or any(not isinstance(term, str) for term in terms):
+            raise ValueError("rank needs at least one string term")
+        wanted = sorted({term.lower() for term in terms})
+        snapshot = self._snapshot()
+        total = len(snapshot["documents"])
+        postings = snapshot["postings"]
+        scored: dict[str, dict] = {}
+        for term in wanted:
+            entries = {doc_id: tf for doc_id, tf in postings.get(term, {}).items() if tf > 0}
+            if not entries:
+                continue
+            idf = math.log((1 + total) / (1 + len(entries))) + 1
+            for doc_id, tf in entries.items():
+                hit = scored.setdefault(doc_id, {"matched": 0, "score": 0.0})
+                hit["matched"] += 1
+                hit["score"] += (1 + math.log(tf)) * idf
+        results = [{"id": doc_id, "matched": hit["matched"], "score": round(hit["score"], 6)}
+                   for doc_id, hit in scored.items()]
+        results.sort(key=lambda item: (-item["score"], item["id"]))
+        return results
 
     def terms(self) -> list[str]:
         return sorted(self._read()["postings"])
