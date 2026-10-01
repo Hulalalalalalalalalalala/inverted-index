@@ -10,9 +10,10 @@ import json
 import sys
 
 from . import DOMAIN, SOURCE_CATEGORIES, __version__
-from .core import InvertedIndex
+from .core import SnapshotError, InvertedIndex
 
 USAGE_ERROR = 2
+STORAGE_ERROR = 1
 
 def _tags() -> list[str]:
     """Tags this domain claims: the comma-separated line that follows each named category heading."""
@@ -76,11 +77,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "query":
             print(json.dumps(index.query(args.terms), ensure_ascii=False))
         elif args.command == "rank":
-            try:
-                print(json.dumps(index.rank(args.terms), ensure_ascii=False))
-            except ValueError as error:
-                print(f"error: {error}", file=sys.stderr)
-                return 1
+            print(json.dumps(index.rank(args.terms), ensure_ascii=False))
         elif args.command == "phrase":
             print(json.dumps(index.phrase(args.text), ensure_ascii=False))
         elif args.command == "terms":
@@ -92,9 +89,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "report":
             print(_report(["postings", "tokenizer"], {"add": True, "query": True, "delete": True, "ranking": True}))
         return 0
-    except FileNotFoundError as error:
+    except (SnapshotError, OSError) as error:
+        # Missing snapshot, corrupt/inconsistent snapshot, or a failed commit.
         print(f"error: {error}", file=sys.stderr)
-        return 1
+        return STORAGE_ERROR
     except (KeyError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return USAGE_ERROR

@@ -1,13 +1,24 @@
-"""An inverted index over tokenised documents, persisted as one JSON snapshot."""
+"""An inverted index over tokenised documents, persisted as one JSON snapshot.
+
+The snapshot is committed atomically: a writer serialises the full state to a
+temporary file in the same directory, fsyncs it and replaces ``index.json`` in
+one ``os.replace`` call, so an interrupted write can only ever leave the old
+snapshot or the new snapshot in place -- never a partial one.  Every read goes
+through structural validation and a consistency check that recomputes the
+postings from the stored documents with the public tokeniser.
+"""
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
+import os
 import re
+import tempfile
 from pathlib import Path
 
-__all__ = ["InvertedIndex"]
+__all__ = ["InvertedIndex", "SnapshotError", "tokenize"]
 
 INDEX_FILE = "index.json"
 TOKEN = re.compile(r"[0-9A-Za-z_]+")
@@ -20,6 +31,27 @@ def tokenize(text: str) -> list[str]:
     return [match.group(0).lower() for match in TOKEN.finditer(text)]
 
 
+class SnapshotError(ValueError):
+    """The persisted snapshot is missing, unreadable, malformed or inconsistent."""
+
+
+def _require_doc_id(doc_id: object) -> str:
+    if not isinstance(doc_id, str) or not doc_id:
+        raise ValueError("doc_id must be a non-empty string")
+    return doc_id
+
+
+def _require_terms(terms: object) -> list[str]:
+    if not isinstance(terms, (list, tuple)) or not terms:
+        raise ValueError("at least one term is required")
+    wanted: list[str] = []
+    for term in terms:
+        if not isinstance(term, str) or not term:
+            raise ValueError("terms must be non-empty strings")
+        wanted.append(term.lower())
+    return wanted
+
+
 class InvertedIndex:
     """A single-process inverted index rooted at ``root``."""
 
@@ -28,50 +60,134 @@ class InvertedIndex:
         self.path = self.directory / INDEX_FILE
 
     def init(self) -> None:
+        """Create a valid empty index, rebuilding over a missing or broken snapshot."""
         self.directory.mkdir(parents=True, exist_ok=True)
         self._write({"documents": {}, "postings": {}})
 
-    def _read(self) -> dict:
+    def _snapshot(self) -> dict:
+        """Read the persisted snapshot, validating shape, types and consistency.
+
+        Recomputes the postings from every stored document using the public
+        tokeniser and demands an exact match, so no corrupt or inconsistent
+        snapshot can ever feed a read computation.
+        """
         if not self.path.is_file():
             raise FileNotFoundError(f"no index at {self.path}; run init first")
-        return json.loads(self.path.read_text(encoding="utf-8"))
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            raise SnapshotError(f"invalid index at {self.path}: {error}") from error
+        except UnicodeDecodeError as error:
+            raise SnapshotError(f"invalid index at {self.path}: {error}") from error
+        if not isinstance(data, dict) or set(data) != {"documents", "postings"}:
+            raise SnapshotError(
+                "index snapshot must be an object with 'documents' and 'postings'"
+            )
+        documents, postings = data["documents"], data["postings"]
+        if not isinstance(documents, dict) or not isinstance(postings, dict):
+            raise SnapshotError("'documents' and 'postings' must be JSON objects")
+        for doc_id, text in documents.items():
+            if not isinstance(doc_id, str) or not isinstance(text, str):
+                raise SnapshotError("document ids and texts must be strings")
+        for term, entries in postings.items():
+            if not isinstance(term, str) or not isinstance(entries, dict):
+                raise SnapshotError("postings must map string terms to objects")
+            for doc_id, frequency in entries.items():
+                if not isinstance(doc_id, str):
+                    raise SnapshotError("posting document ids must be strings")
+                if isinstance(frequency, bool) or not isinstance(frequency, int) or frequency < 0:
+                    raise SnapshotError("posting frequencies must be non-negative integers")
+        expected: dict[str, dict[str, int]] = {}
+        for doc_id, text in documents.items():
+            frequencies: dict[str, int] = {}
+            for token in tokenize(text):
+                frequencies[token] = frequencies.get(token, 0) + 1
+            for token, frequency in frequencies.items():
+                expected.setdefault(token, {})[doc_id] = frequency
+        if postings != expected:
+            raise SnapshotError("postings are inconsistent with the stored documents")
+        return data
 
-    def _write(self, document: dict) -> None:
+    def _write(self, snapshot: dict) -> None:
+        """Commit the full snapshot atomically; failures leave the old file intact."""
         self.directory.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(document, sort_keys=True, indent=2), encoding="utf-8")
+        self._purge_staging()
+        payload = json.dumps(snapshot, sort_keys=True, indent=2)
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{INDEX_FILE}.", suffix=".tmp", dir=self.directory
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_name, self.path)
+            self._sync_directory()
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary_name)
+            raise
+
+    def _purge_staging(self) -> None:
+        """Remove staging files left behind by a hard-killed earlier write.
+
+        Writers are single-process (see README), so every ``.index.json.*.tmp``
+        can only be a remnant of a dead writer -- never a live rename source.
+        """
+        pattern = f".{INDEX_FILE}.*.tmp"
+        for remnant in self.directory.glob(pattern):
+            with contextlib.suppress(OSError):
+                remnant.unlink()
+
+    def _sync_directory(self) -> None:
+        """Best-effort fsync of the directory so the rename is durable."""
+        try:
+            descriptor = os.open(self.directory, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(descriptor)
+        except OSError:
+            pass
+        finally:
+            os.close(descriptor)
 
     def add(self, doc_id: str, text: str) -> int:
-        if not doc_id:
-            raise ValueError("doc_id must be non-empty")
-        document = self._read()
-        if doc_id in document["documents"]:
+        doc_id = _require_doc_id(doc_id)
+        if not isinstance(text, str):
+            raise ValueError("text must be a string")
+        snapshot = self._snapshot()
+        if doc_id in snapshot["documents"]:
             raise ValueError(f"document {doc_id!r} already exists")
-        document["documents"][doc_id] = text
-        for token in set(tokenize(text)):
-            document["postings"].setdefault(token, {})[doc_id] = tokenize(text).count(token)
-        self._write(document)
-        return len(document["documents"])
+        snapshot["documents"][doc_id] = text
+        frequencies: dict[str, int] = {}
+        for token in tokenize(text):
+            frequencies[token] = frequencies.get(token, 0) + 1
+        for token, frequency in frequencies.items():
+            snapshot["postings"].setdefault(token, {})[doc_id] = frequency
+        self._write(snapshot)
+        return len(snapshot["documents"])
 
     def get(self, doc_id: str) -> str | None:
-        return self._read()["documents"].get(doc_id)
+        doc_id = _require_doc_id(doc_id)
+        return self._snapshot()["documents"].get(doc_id)
 
     def delete(self, doc_id: str) -> bool:
-        document = self._read()
-        if doc_id not in document["documents"]:
+        doc_id = _require_doc_id(doc_id)
+        snapshot = self._snapshot()
+        if doc_id not in snapshot["documents"]:
             return False
-        del document["documents"][doc_id]
-        for token, postings in list(document["postings"].items()):
-            postings.pop(doc_id, None)
-            if not postings:
-                del document["postings"][token]
-        self._write(document)
+        del snapshot["documents"][doc_id]
+        for token, entries in list(snapshot["postings"].items()):
+            entries.pop(doc_id, None)
+            if not entries:
+                del snapshot["postings"][token]
+        self._write(snapshot)
         return True
 
     def query(self, terms: list[str]) -> list[dict]:
-        if not terms:
-            raise ValueError("query needs at least one term")
-        wanted = [term.lower() for term in terms]
-        postings = self._read()["postings"]
+        wanted = _require_terms(terms)
+        postings = self._snapshot()["postings"]
         sets = [set(postings.get(term, {})) for term in wanted]
         hits = set.intersection(*sets) if sets else set()
         return [{"id": doc_id, "matched": sum(1 for term in wanted if doc_id in postings.get(term, {}))}
@@ -87,7 +203,7 @@ class InvertedIndex:
         tokens = tokenize(text)
         if not tokens:
             raise ValueError("phrase needs at least one token")
-        documents = self._read()["documents"]
+        documents = self._snapshot()["documents"]
         results = []
         for doc_id in sorted(documents):
             sequence = tokenize(documents[doc_id])
@@ -97,35 +213,9 @@ class InvertedIndex:
                 results.append({"id": doc_id, "positions": positions})
         return results
 
-    def _snapshot(self) -> dict:
-        """Read the persisted snapshot and validate its shape and field types."""
-        if not self.path.is_file():
-            raise FileNotFoundError(f"no index at {self.path}; run init first")
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as error:
-            raise ValueError(f"invalid index at {self.path}: {error}") from error
-        if not isinstance(data, dict):
-            raise ValueError("index snapshot must be a JSON object")
-        documents, postings = data.get("documents"), data.get("postings")
-        if not isinstance(documents, dict) or not isinstance(postings, dict):
-            raise ValueError("index snapshot needs object 'documents' and 'postings'")
-        for doc_id, text in documents.items():
-            if not isinstance(doc_id, str) or not isinstance(text, str):
-                raise ValueError("document ids and texts must be strings")
-        for term, entries in postings.items():
-            if not isinstance(term, str) or not isinstance(entries, dict):
-                raise ValueError("postings must map string terms to per-document objects")
-            for doc_id, tf in entries.items():
-                if not isinstance(doc_id, str) or isinstance(tf, bool) or not isinstance(tf, int) or tf < 0:
-                    raise ValueError("posting frequencies must be non-negative integers")
-        return data
-
     def rank(self, terms: list[str]) -> list[dict]:
         """Score documents against ``terms`` with a tf-idf sum, best first."""
-        if not terms or any(not isinstance(term, str) for term in terms):
-            raise ValueError("rank needs at least one string term")
-        wanted = sorted({term.lower() for term in terms})
+        wanted = sorted(set(_require_terms(terms)))
         snapshot = self._snapshot()
         total = len(snapshot["documents"])
         postings = snapshot["postings"]
@@ -145,12 +235,12 @@ class InvertedIndex:
         return results
 
     def terms(self) -> list[str]:
-        return sorted(self._read()["postings"])
+        return sorted(self._snapshot()["postings"])
 
     def stats(self) -> dict:
-        document = self._read()
-        return {"documents": len(document["documents"]), "terms": len(document["postings"]),
-                "postings": sum(len(entries) for entries in document["postings"].values())}
+        snapshot = self._snapshot()
+        return {"documents": len(snapshot["documents"]), "terms": len(snapshot["postings"]),
+                "postings": sum(len(entries) for entries in snapshot["postings"].values())}
 
     def reload(self) -> None:
-        self._read()
+        self._snapshot()
