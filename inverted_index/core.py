@@ -125,6 +125,27 @@ class InvertedIndex:
         self._write(document)
         return len(document["documents"])
 
+    def update(self, doc_id: str, text: str) -> int:
+        """Replace ``doc_id``'s text and rebuild its postings, frequencies and positions.
+
+        The document count is unchanged; the new total is returned.
+        """
+        _require_non_empty_string(doc_id, "doc_id")
+        _require_non_empty_string(text, "text")
+        document = self._read()
+        if doc_id not in document["documents"]:
+            raise KeyError(doc_id)
+        document["documents"][doc_id] = text
+        postings = document["postings"]
+        for token in list(postings):
+            postings[token].pop(doc_id, None)
+            if not postings[token]:
+                del postings[token]
+        for token, frequency in Counter(tokenize(text)).items():
+            postings.setdefault(token, {})[doc_id] = frequency
+        self._write(document)
+        return len(document["documents"])
+
     def get(self, doc_id: str) -> str | None:
         _require_non_empty_string(doc_id, "doc_id")
         return self._read()["documents"].get(doc_id)
