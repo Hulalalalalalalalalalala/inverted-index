@@ -50,6 +50,7 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_parser("init", help="create an empty store")
     add = sub.add_parser("add"); add.add_argument("doc_id"); add.add_argument("text")
     get = sub.add_parser("get"); get.add_argument("doc_id")
+    update = sub.add_parser("update", help="replace a document's text"); update.add_argument("doc_id"); update.add_argument("text")
     delete = sub.add_parser("delete"); delete.add_argument("doc_id")
     query = sub.add_parser("query"); query.add_argument("terms", nargs="+")
     rank = sub.add_parser("rank", help="score documents against terms"); rank.add_argument("terms", nargs="+")
@@ -71,6 +72,8 @@ def main(argv: list[str] | None = None) -> int:
             print(index.add(args.doc_id, args.text))
         elif args.command == "get":
             text = index.get(args.doc_id); print("" if text is None else text)
+        elif args.command == "update":
+            print(index.update(args.doc_id, args.text))
         elif args.command == "delete":
             print("true" if index.delete(args.doc_id) else "false")
         elif args.command == "query":
