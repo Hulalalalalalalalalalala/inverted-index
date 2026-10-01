@@ -69,16 +69,73 @@ def _sequence_starts(sequence: list[str], fragment: list[str]) -> list[int]:
 
 
 _SEARCH_OPERATORS = ("AND", "OR", "NOT")
+_NEAR_NAME = "NEAR"
+_ASCII_DIGITS = frozenset("0123456789")
+_NEAR_MAX_GAP = 2147483647
+
+
+def _skip_spaces(expression: str, position: int) -> int:
+    while position < len(expression) and expression[position].isspace():
+        position += 1
+    return position
+
+
+def _read_near_fragment(expression: str, position: int) -> tuple[list[str], int]:
+    """Read one double-quoted NEAR fragment starting at ``position``.
+
+    Commas and parentheses inside the quotes are plain text; double quotes
+    cannot be embedded or escaped. The raw text is tokenised with the usual
+    :func:`tokenize` rules and must yield at least one token.
+    """
+    if position >= len(expression) or expression[position] != '"':
+        raise ValueError("NEAR fragments must be double-quoted")
+    end = expression.find('"', position + 1)
+    if end == -1:
+        raise ValueError("unclosed double quote in search expression")
+    fragment_tokens = tokenize(expression[position + 1:end])
+    if not fragment_tokens:
+        raise ValueError("NEAR fragments need at least one token each")
+    return fragment_tokens, end + 1
+
+
+def _lex_near_call(expression: str, position: int) -> tuple[tuple[str, object], int]:
+    """Lex a ``NEAR("left", "right", distance)`` call; ``position`` is at ``(``."""
+    position = _skip_spaces(expression, position + 1)
+    left_tokens, position = _read_near_fragment(expression, position)
+    position = _skip_spaces(expression, position)
+    if position >= len(expression) or expression[position] != ",":
+        raise ValueError("missing comma between NEAR arguments")
+    position = _skip_spaces(expression, position + 1)
+    right_tokens, position = _read_near_fragment(expression, position)
+    position = _skip_spaces(expression, position)
+    if position >= len(expression) or expression[position] != ",":
+        raise ValueError("NEAR needs exactly three arguments")
+    position = _skip_spaces(expression, position + 1)
+    digits_start = position
+    while position < len(expression) and expression[position] in _ASCII_DIGITS:
+        position += 1
+    if position == digits_start:
+        raise ValueError("NEAR distance must be an ASCII decimal integer")
+    distance_text = expression[digits_start:position]
+    distance = int(distance_text)
+    if distance > _NEAR_MAX_GAP:
+        raise ValueError("NEAR distance must be within 0..2147483647")
+    position = _skip_spaces(expression, position)
+    if position >= len(expression) or expression[position] != ")":
+        raise ValueError("unbalanced parentheses in search expression")
+    return ("NEAR", (left_tokens, right_tokens, distance)), position + 1
 
 
 def _lex_search(expression: str) -> list[tuple[str, object]]:
     """Split a search expression into ``(kind, value)`` tokens.
 
     Kinds are ``TERM`` (value the lower-cased term), ``WILDCARD`` (value the
-    lower-cased pattern), ``PHRASE`` (value the tokenised phrase), ``LPAREN``,
-    ``RPAREN`` and the operators themselves. Operators are case-sensitive;
-    anything outside terms, wildcards, quotes, parentheses and whitespace is
-    rejected. A wildcard fragment needs at least one literal character.
+    lower-cased pattern), ``PHRASE`` (value the tokenised phrase), ``NEAR``
+    (value ``(left_tokens, right_tokens, max_gap)``), ``LPAREN``, ``RPAREN``
+    and the operators themselves. Operators are case-sensitive; a bare
+    ``NEAR`` not directly followed by ``(`` is an ordinary term. Anything
+    outside terms, wildcards, quotes, parentheses and whitespace is rejected.
+    A wildcard fragment needs at least one literal character.
     """
     tokens: list[tuple[str, object]] = []
     position = 0
@@ -106,6 +163,12 @@ def _lex_search(expression: str) -> list[tuple[str, object]]:
             if match is None:
                 raise ValueError(f"unsupported character {char!r} in search expression")
             word = match.group(0)
+            if word == _NEAR_NAME:
+                probe = _skip_spaces(expression, match.end())
+                if probe < len(expression) and expression[probe] == "(":
+                    token, position = _lex_near_call(expression, probe)
+                    tokens.append(token)
+                    continue
             if word in _SEARCH_OPERATORS:
                 tokens.append((word, word))
             elif "*" in word or "?" in word:
@@ -164,6 +227,8 @@ def _parse_search_primary(tokens, position):
         return ("WILDCARD", value), position + 1
     if kind == "PHRASE":
         return ("PHRASE", value), position + 1
+    if kind == "NEAR":
+        return ("NEAR", value), position + 1
     if kind == "LPAREN":
         node, position = _parse_search_or(tokens, position + 1)
         if position >= len(tokens) or tokens[position][0] != "RPAREN":
@@ -172,6 +237,52 @@ def _parse_search_primary(tokens, position):
     if kind == "RPAREN":
         raise ValueError("unbalanced parentheses in search expression")
     raise ValueError(f"missing operand in search expression before {kind}")
+
+
+def _near_match(sequence: list[str], left: list[str], right: list[str], max_gap: int) -> bool:
+    """Whether ``left`` and ``right`` each occur once, non-overlapping, in either order.
+
+    Uses the same gap rule as :meth:`InvertedIndex.near`: the number of tokens
+    strictly between the two fragments is at most ``max_gap``.
+    """
+    left_length, right_length = len(left), len(right)
+    for left_start in _sequence_starts(sequence, left):
+        left_end = left_start + left_length
+        for right_start in _sequence_starts(sequence, right):
+            right_end = right_start + right_length
+            if right_start >= left_end and right_start - left_end <= max_gap:
+                return True
+            if left_start >= right_end and left_start - right_end <= max_gap:
+                return True
+    return False
+
+
+def _evaluate_search(tree, documents: dict[str, str], postings: dict[str, dict]) -> set[str]:
+    """Evaluate a parsed search tree against a snapshot, returning matching doc ids."""
+    universe = set(documents)
+
+    def evaluate(node) -> set[str]:
+        kind = node[0]
+        if kind == "TERM":
+            return set(postings.get(node[1], {}))
+        if kind == "WILDCARD":
+            matcher = _compile_pattern(node[1])
+            return {doc_id for term, entries in postings.items() if matcher(term)
+                    for doc_id in entries}
+        if kind == "PHRASE":
+            return {doc_id for doc_id, text in documents.items()
+                    if _sequence_starts(tokenize(text), node[1])}
+        if kind == "NEAR":
+            left, right, max_gap = node[1]
+            return {doc_id for doc_id, text in documents.items()
+                    if _near_match(tokenize(text), left, right, max_gap)}
+        if kind == "AND":
+            return evaluate(node[1]) & evaluate(node[2])
+        if kind == "OR":
+            return evaluate(node[1]) | evaluate(node[2])
+        return universe - evaluate(node[1])
+
+    return evaluate(tree)
 
 
 class InvertedIndex:
@@ -427,45 +538,30 @@ class InvertedIndex:
         """Evaluate a boolean search expression and return matching document ids.
 
         The expression combines plain terms, wildcard terms, double-quoted
-        phrases, parentheses and the case-sensitive operators AND, OR, NOT;
-        precedence is NOT, then AND, then OR, with left-to-right associativity
-        at each level. An unquoted fragment containing ``*`` (zero or more
-        characters) or ``?`` (exactly one character) is a wildcard term that
-        hits every document containing at least one expanded term; it needs at
-        least one literal character. Terms hit documents containing the term,
-        phrases hit documents containing the consecutive token sequence (the
-        quoted text keeps ``tokenize`` semantics, wildcards are not special
-        there), AND/OR intersect/union the two sides and NOT complements
-        against every document in the index. Returns the matching document ids
-        sorted ascending; the index is only read, never written. Malformed
+        phrases, ``NEAR("left", "right", distance)`` conditions, parentheses
+        and the case-sensitive operators AND, OR, NOT; precedence is NOT, then
+        AND, then OR, with left-to-right associativity at each level. An
+        unquoted fragment containing ``*`` (zero or more characters) or ``?``
+        (exactly one character) is a wildcard term that hits every document
+        containing at least one expanded term; it needs at least one literal
+        character. Terms hit documents containing the term, phrases hit
+        documents containing the consecutive token sequence (the quoted text
+        keeps ``tokenize`` semantics, wildcards are not special there), a NEAR
+        condition hits documents where both quoted fragments (wildcards not
+        expanded there) occur consecutively, non-overlapping, in either order
+        with at most ``distance`` tokens strictly between them (an ASCII
+        decimal integer from 0 to 2147483647, leading zeros allowed); a bare
+        ``NEAR`` without a following parenthesis is still an ordinary term.
+        AND/OR intersect/union the two sides and NOT complements against every
+        document in the index. Returns the matching document ids sorted
+        ascending; the index is only read, never written. Malformed
         expressions raise ``ValueError``.
         """
         if not isinstance(expression, str):
             raise ValueError("expression must be a string")
         tree = _parse_search(_lex_search(expression))
         snapshot = self._read()
-        documents = snapshot["documents"]
-        postings = snapshot["postings"]
-        universe = set(documents)
-
-        def evaluate(node) -> set[str]:
-            kind = node[0]
-            if kind == "TERM":
-                return set(postings.get(node[1], {}))
-            if kind == "WILDCARD":
-                matcher = _compile_pattern(node[1])
-                return {doc_id for term, entries in postings.items() if matcher(term)
-                        for doc_id in entries}
-            if kind == "PHRASE":
-                return {doc_id for doc_id, text in documents.items()
-                        if _sequence_starts(tokenize(text), node[1])}
-            if kind == "AND":
-                return evaluate(node[1]) & evaluate(node[2])
-            if kind == "OR":
-                return evaluate(node[1]) | evaluate(node[2])
-            return universe - evaluate(node[1])
-
-        return sorted(evaluate(tree))
+        return sorted(_evaluate_search(tree, snapshot["documents"], snapshot["postings"]))
 
     def rank(self, terms: list[str]) -> list[dict]:
         """Score documents against ``terms`` with a tf-idf sum, best first."""
@@ -531,26 +627,7 @@ class InvertedIndex:
         total_length = sum(lengths.values())
         candidates: set[str] | None = None
         if tree is not None:
-            universe = set(documents)
-
-            def evaluate(node) -> set[str]:
-                kind = node[0]
-                if kind == "TERM":
-                    return set(postings.get(node[1], {}))
-                if kind == "WILDCARD":
-                    matcher = _compile_pattern(node[1])
-                    return {doc_id for term, entries in postings.items() if matcher(term)
-                            for doc_id in entries}
-                if kind == "PHRASE":
-                    return {doc_id for doc_id, text in documents.items()
-                            if _sequence_starts(tokenize(text), node[1])}
-                if kind == "AND":
-                    return evaluate(node[1]) & evaluate(node[2])
-                if kind == "OR":
-                    return evaluate(node[1]) | evaluate(node[2])
-                return universe - evaluate(node[1])
-
-            candidates = evaluate(tree)
+            candidates = _evaluate_search(tree, documents, postings)
         if n_docs == 0 or total_length == 0:
             return []
         avgdl = total_length / n_docs
