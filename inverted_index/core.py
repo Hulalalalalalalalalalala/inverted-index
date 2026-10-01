@@ -46,6 +46,105 @@ def _sequence_starts(sequence: list[str], fragment: list[str]) -> list[int]:
             if sequence[start:start + length] == fragment]
 
 
+_SEARCH_OPERATORS = ("AND", "OR", "NOT")
+
+
+def _lex_search(expression: str) -> list[tuple[str, object]]:
+    """Split a search expression into ``(kind, value)`` tokens.
+
+    Kinds are ``TERM`` (value the lower-cased term), ``PHRASE`` (value the
+    tokenised phrase), ``LPAREN``, ``RPAREN`` and the operators themselves.
+    Operators are case-sensitive; anything outside terms, quotes, parentheses
+    and whitespace is rejected.
+    """
+    tokens: list[tuple[str, object]] = []
+    position = 0
+    while position < len(expression):
+        char = expression[position]
+        if char.isspace():
+            position += 1
+        elif char == "(":
+            tokens.append(("LPAREN", char))
+            position += 1
+        elif char == ")":
+            tokens.append(("RPAREN", char))
+            position += 1
+        elif char == '"':
+            end = expression.find('"', position + 1)
+            if end == -1:
+                raise ValueError("unclosed double quote in search expression")
+            phrase_tokens = tokenize(expression[position + 1:end])
+            if not phrase_tokens:
+                raise ValueError("quoted phrase needs at least one token")
+            tokens.append(("PHRASE", phrase_tokens))
+            position = end + 1
+        else:
+            match = TOKEN.match(expression, position)
+            if match is None:
+                raise ValueError(f"unsupported character {char!r} in search expression")
+            word = match.group(0)
+            if word in _SEARCH_OPERATORS:
+                tokens.append((word, word))
+            else:
+                tokens.append(("TERM", word.lower()))
+            position = match.end()
+    return tokens
+
+
+def _parse_search(tokens: list[tuple[str, object]]):
+    """Parse lexed tokens into a tree; NOT binds tightest, then AND, then OR."""
+    if not tokens:
+        raise ValueError("search expression must not be empty")
+    node, position = _parse_search_or(tokens, 0)
+    if position != len(tokens):
+        kind = tokens[position][0]
+        if kind == "RPAREN":
+            raise ValueError("unbalanced parentheses in search expression")
+        raise ValueError("missing AND or OR between operands in search expression")
+    return node
+
+
+def _parse_search_or(tokens, position):
+    node, position = _parse_search_and(tokens, position)
+    while position < len(tokens) and tokens[position][0] == "OR":
+        right, position = _parse_search_and(tokens, position + 1)
+        node = ("OR", node, right)
+    return node, position
+
+
+def _parse_search_and(tokens, position):
+    node, position = _parse_search_not(tokens, position)
+    while position < len(tokens) and tokens[position][0] == "AND":
+        right, position = _parse_search_not(tokens, position + 1)
+        node = ("AND", node, right)
+    return node, position
+
+
+def _parse_search_not(tokens, position):
+    if position < len(tokens) and tokens[position][0] == "NOT":
+        operand, position = _parse_search_not(tokens, position + 1)
+        return ("NOT", operand), position
+    return _parse_search_primary(tokens, position)
+
+
+def _parse_search_primary(tokens, position):
+    if position >= len(tokens):
+        raise ValueError("missing operand in search expression")
+    kind, value = tokens[position]
+    if kind == "TERM":
+        return ("TERM", value), position + 1
+    if kind == "PHRASE":
+        return ("PHRASE", value), position + 1
+    if kind == "LPAREN":
+        node, position = _parse_search_or(tokens, position + 1)
+        if position >= len(tokens) or tokens[position][0] != "RPAREN":
+            raise ValueError("unbalanced parentheses in search expression")
+        return node, position + 1
+    if kind == "RPAREN":
+        raise ValueError("unbalanced parentheses in search expression")
+    raise ValueError(f"missing operand in search expression before {kind}")
+
+
 class InvertedIndex:
     """A single-process inverted index rooted at ``root``."""
 
@@ -294,6 +393,41 @@ class InvertedIndex:
                 occurrences.sort()
                 results.append({"id": doc_id, "occurrences": occurrences})
         return results
+
+    def search(self, expression: str) -> list[str]:
+        """Evaluate a boolean search expression and return matching document ids.
+
+        The expression combines plain terms, double-quoted phrases, parentheses
+        and the case-sensitive operators AND, OR, NOT; precedence is NOT, then
+        AND, then OR, with left-to-right associativity at each level. Terms hit
+        documents containing the term, phrases hit documents containing the
+        consecutive token sequence, AND/OR intersect/union the two sides and
+        NOT complements against every document in the index. Returns the
+        matching document ids sorted ascending; the index is only read, never
+        written. Malformed expressions raise ``ValueError``.
+        """
+        if not isinstance(expression, str):
+            raise ValueError("expression must be a string")
+        tree = _parse_search(_lex_search(expression))
+        snapshot = self._read()
+        documents = snapshot["documents"]
+        postings = snapshot["postings"]
+        universe = set(documents)
+
+        def evaluate(node) -> set[str]:
+            kind = node[0]
+            if kind == "TERM":
+                return set(postings.get(node[1], {}))
+            if kind == "PHRASE":
+                return {doc_id for doc_id, text in documents.items()
+                        if _sequence_starts(tokenize(text), node[1])}
+            if kind == "AND":
+                return evaluate(node[1]) & evaluate(node[2])
+            if kind == "OR":
+                return evaluate(node[1]) | evaluate(node[2])
+            return universe - evaluate(node[1])
+
+        return sorted(evaluate(tree))
 
     def rank(self, terms: list[str]) -> list[dict]:
         """Score documents against ``terms`` with a tf-idf sum, best first."""
