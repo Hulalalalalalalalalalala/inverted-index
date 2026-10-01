@@ -124,6 +124,25 @@ class InvertedIndex:
         results.sort(key=lambda item: (-item["score"], item["id"]))
         return results
 
+    def phrase(self, text: str) -> list[dict]:
+        """Find documents where the tokenised ``text`` appears as a contiguous run."""
+        if not isinstance(text, str):
+            raise ValueError("text must be a string")
+        wanted = tokenize(text)
+        if not wanted:
+            raise ValueError("phrase needs at least one term")
+        snapshot = self._read()
+        documents, postings = snapshot["documents"], snapshot["postings"]
+        width, first = len(wanted), wanted[0]
+        results: list[dict] = []
+        for doc_id in sorted(postings.get(first, {})):
+            tokens = tokenize(documents[doc_id])
+            positions = [index for index in range(len(tokens) - width + 1)
+                         if all(tokens[index + offset] == term for offset, term in enumerate(wanted))]
+            if positions:
+                results.append({"id": doc_id, "positions": positions})
+        return results
+
     def terms(self) -> list[str]:
         return sorted(self._read()["postings"])
 
