@@ -14,6 +14,10 @@ __all__ = ["InvertedIndex", "SnapshotError", "tokenize"]
 
 INDEX_FILE = "index.json"
 TOKEN = re.compile(r"[0-9A-Za-z_]+")
+#: An unquoted search fragment: a plain term or a wildcard pattern.
+SEARCH_WORD = re.compile(r"[0-9A-Za-z_*?]+")
+#: A lower-cased wildcard pattern consists solely of term characters and wildcards.
+PATTERN_CHARS = re.compile(r"[0-9a-z_*?]+")
 
 
 class SnapshotError(ValueError):
@@ -44,6 +48,34 @@ def _sequence_starts(sequence: list[str], fragment: list[str]) -> list[int]:
     length = len(fragment)
     return [start for start in range(len(sequence) - length + 1)
             if sequence[start:start + length] == fragment]
+
+
+def _compile_pattern(pattern: object, *, require_literal: bool = False) -> re.Pattern:
+    """Validate a wildcard pattern and return an anchored, full-match regex.
+
+    ``*`` matches zero or more characters and ``?`` exactly one; anything else
+    must be a term character (ASCII letter, digit or underscore), matched
+    literally after lower-casing. Empty, non-string and illegal-character
+    patterns raise ``ValueError``. With ``require_literal``, a pattern without
+    at least one literal character is rejected too.
+    """
+    if not isinstance(pattern, str):
+        raise ValueError("pattern must be a string")
+    lowered = pattern.lower()
+    if not lowered or not PATTERN_CHARS.fullmatch(lowered):
+        raise ValueError("pattern must be a non-empty string of term characters, '*' and '?'")
+    if require_literal and not any(char not in "*?" for char in lowered):
+        raise ValueError("wildcard pattern needs at least one literal character")
+    pieces = ["^"]
+    for char in lowered:
+        if char == "*":
+            pieces.append(".*")
+        elif char == "?":
+            pieces.append(".")
+        else:
+            pieces.append(re.escape(char))
+    pieces.append(r"\Z")
+    return re.compile("".join(pieces), re.DOTALL)
 
 
 _SEARCH_OPERATORS = ("AND", "OR", "NOT")
@@ -79,14 +111,20 @@ def _lex_search(expression: str) -> list[tuple[str, object]]:
             tokens.append(("PHRASE", phrase_tokens))
             position = end + 1
         else:
-            match = TOKEN.match(expression, position)
+            match = SEARCH_WORD.match(expression, position)
             if match is None:
                 raise ValueError(f"unsupported character {char!r} in search expression")
             word = match.group(0)
-            if word in _SEARCH_OPERATORS:
-                tokens.append((word, word))
+            if "*" not in word and "?" not in word:
+                if word in _SEARCH_OPERATORS:
+                    tokens.append((word, word))
+                else:
+                    tokens.append(("TERM", word.lower()))
             else:
-                tokens.append(("TERM", word.lower()))
+                # Operators are plain words; a wildcard fragment can never be one.
+                if not any(each not in "*?" for each in word):
+                    raise ValueError("wildcard term needs at least one literal character")
+                tokens.append(("WILDCARD", _compile_pattern(word)))
             position = match.end()
     return tokens
 
@@ -133,6 +171,8 @@ def _parse_search_primary(tokens, position):
     kind, value = tokens[position]
     if kind == "TERM":
         return ("TERM", value), position + 1
+    if kind == "WILDCARD":
+        return ("WILDCARD", value), position + 1
     if kind == "PHRASE":
         return ("PHRASE", value), position + 1
     if kind == "LPAREN":
@@ -394,6 +434,19 @@ class InvertedIndex:
                 results.append({"id": doc_id, "occurrences": occurrences})
         return results
 
+    def expand(self, pattern: str) -> list[str]:
+        """Return every indexed term matching the wildcard pattern, sorted.
+
+        ``*`` matches zero or more characters and ``?`` exactly one; the
+        pattern follows the term rules otherwise (ASCII letters, digits and
+        underscores, lower-cased). The result is sorted by Unicode code point
+        and de-duplicated; an unmatched pattern gives an empty list. Empty,
+        non-string or illegal-character patterns raise ``ValueError``.
+        """
+        matcher = _compile_pattern(pattern)
+        postings = self._read()["postings"]
+        return sorted(term for term in postings if matcher.match(term))
+
     def search(self, expression: str) -> list[str]:
         """Evaluate a boolean search expression and return matching document ids.
 
@@ -418,6 +471,13 @@ class InvertedIndex:
             kind = node[0]
             if kind == "TERM":
                 return set(postings.get(node[1], {}))
+            if kind == "WILDCARD":
+                matcher = node[1]
+                hits: set[str] = set()
+                for term, entries in postings.items():
+                    if matcher.match(term):
+                        hits.update(entries)
+                return hits
             if kind == "PHRASE":
                 return {doc_id for doc_id, text in documents.items()
                         if _sequence_starts(tokenize(text), node[1])}

@@ -61,8 +61,10 @@ def _parser() -> argparse.ArgumentParser:
     near.add_argument("left")
     near.add_argument("right")
     near.add_argument("max_gap", type=int, help="maximum number of tokens strictly between the fragments")
-    search = sub.add_parser("search", help="evaluate a boolean expression of terms, quoted phrases, AND, OR, NOT")
+    search = sub.add_parser("search", help="evaluate a boolean expression of terms, wildcard terms, quoted phrases, AND, OR, NOT")
     search.add_argument("expression")
+    expand_cmd = sub.add_parser("expand", help="list indexed terms matching a wildcard pattern")
+    expand_cmd.add_argument("pattern")
     sub.add_parser("terms", help="list every term")
     sub.add_parser("stats", help="print document, term and posting counts")
     sub.add_parser("reload", help="reload the index snapshot")
@@ -97,6 +99,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(index.near(args.left, args.right, args.max_gap), ensure_ascii=False))
         elif args.command == "search":
             print(json.dumps(index.search(args.expression), ensure_ascii=False))
+        elif args.command == "expand":
+            print(json.dumps(index.expand(args.pattern)))
         elif args.command == "terms":
             print(json.dumps(index.terms()))
         elif args.command == "stats":
