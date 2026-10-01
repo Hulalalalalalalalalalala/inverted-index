@@ -69,16 +69,93 @@ def _sequence_starts(sequence: list[str], fragment: list[str]) -> list[int]:
 
 
 _SEARCH_OPERATORS = ("AND", "OR", "NOT")
+_NEAR_MAX_GAP = 2_147_483_647
+
+
+def _skip_spaces(text: str, position: int) -> int:
+    while position < len(text) and text[position].isspace():
+        position += 1
+    return position
+
+
+def _read_near_call(expression: str, position: int):
+    """Parse the arguments of ``NEAR(...)`` starting just after its opening paren.
+
+    Returns ``((left_tokens, right_tokens, max_gap), position)`` with position
+    just past the closing paren. Each fragment must use double quotes (commas
+    and parens inside are ordinary fragment text), and the distance must be an
+    ASCII decimal integer in ``[0, 2147483647]`` with optional leading zeros;
+    whitespace is allowed around the arguments and commas.
+    """
+    def quoted_fragment(position: int):
+        position = _skip_spaces(expression, position)
+        if position >= len(expression) or expression[position] != '"':
+            raise ValueError("NEAR fragment must be enclosed in double quotes")
+        end = expression.find('"', position + 1)
+        if end == -1:
+            raise ValueError("unclosed double quote in NEAR expression")
+        fragment_tokens = tokenize(expression[position + 1:end])
+        if not fragment_tokens:
+            raise ValueError("NEAR fragment needs at least one token")
+        return fragment_tokens, _skip_spaces(expression, end + 1)
+
+    def comma(position: int) -> int:
+        position = _skip_spaces(expression, position)
+        if position >= len(expression) or expression[position] != ",":
+            raise ValueError("NEAR arguments must be separated by commas")
+        return _skip_spaces(expression, position + 1)
+
+    left_tokens, position = quoted_fragment(position)
+    position = comma(position)
+    right_tokens, position = quoted_fragment(position)
+    position = comma(position)
+    position = _skip_spaces(expression, position)
+    digit_end = position
+    while digit_end < len(expression) and "0" <= expression[digit_end] <= "9":
+        digit_end += 1
+    if digit_end == position:
+        raise ValueError("NEAR distance must be an ASCII decimal integer")
+    max_gap = int(expression[position:digit_end])
+    if max_gap > _NEAR_MAX_GAP:
+        raise ValueError("NEAR distance must be at most 2147483647")
+    position = _skip_spaces(expression, digit_end)
+    if position >= len(expression) or expression[position] != ")":
+        raise ValueError("NEAR call is missing its closing parenthesis")
+    return (left_tokens, right_tokens, max_gap), position + 1
+
+
+def _near_occurrences(sequence: list[str], left_tokens: list[str],
+                      right_tokens: list[str], max_gap: int) -> list[list[int]]:
+    """All ``[left_start, right_start]`` pairs satisfying the near contract.
+
+    Either fragment may come first; matches must be consecutive and
+    non-overlapping, and the number of tokens strictly between them may not
+    exceed ``max_gap``. Sorted by ``(left_start, right_start)``.
+    """
+    occurrences = []
+    for left_start in _sequence_starts(sequence, left_tokens):
+        left_end = left_start + len(left_tokens)
+        for right_start in _sequence_starts(sequence, right_tokens):
+            right_end = right_start + len(right_tokens)
+            if right_start >= left_end and right_start - left_end <= max_gap:
+                occurrences.append([left_start, right_start])
+            elif left_start >= right_end and left_start - right_end <= max_gap:
+                occurrences.append([left_start, right_start])
+    occurrences.sort()
+    return occurrences
 
 
 def _lex_search(expression: str) -> list[tuple[str, object]]:
     """Split a search expression into ``(kind, value)`` tokens.
 
     Kinds are ``TERM`` (value the lower-cased term), ``WILDCARD`` (value the
-    lower-cased pattern), ``PHRASE`` (value the tokenised phrase), ``LPAREN``,
-    ``RPAREN`` and the operators themselves. Operators are case-sensitive;
-    anything outside terms, wildcards, quotes, parentheses and whitespace is
-    rejected. A wildcard fragment needs at least one literal character.
+    lower-cased pattern), ``PHRASE`` (value the tokenised phrase), ``NEAR``
+    (value ``(left_tokens, right_tokens, max_gap)``), ``LPAREN``, ``RPAREN``
+    and the operators themselves. Operators are case-sensitive; a capital
+    ``NEAR`` directly followed by ``(`` introduces a near atom, while a
+    standalone ``NEAR`` is a plain term. Anything else outside terms,
+    wildcards, quotes, parentheses and whitespace is rejected. A wildcard
+    fragment needs at least one literal character.
     """
     tokens: list[tuple[str, object]] = []
     position = 0
@@ -108,13 +185,24 @@ def _lex_search(expression: str) -> list[tuple[str, object]]:
             word = match.group(0)
             if word in _SEARCH_OPERATORS:
                 tokens.append((word, word))
+                position = match.end()
+            elif word == "NEAR":
+                call_position = _skip_spaces(expression, match.end())
+                if call_position < len(expression) and expression[call_position] == "(":
+                    value, position = _read_near_call(expression, call_position + 1)
+                    tokens.append(("NEAR", value))
+                else:
+                    # A standalone NEAR is an ordinary term (the name is case-sensitive).
+                    tokens.append(("TERM", word.lower()))
+                    position = match.end()
             elif "*" in word or "?" in word:
                 if all(char in "*?" for char in word):
                     raise ValueError("wildcard term needs at least one literal character")
                 tokens.append(("WILDCARD", word.lower()))
+                position = match.end()
             else:
                 tokens.append(("TERM", word.lower()))
-            position = match.end()
+                position = match.end()
     return tokens
 
 
@@ -164,6 +252,8 @@ def _parse_search_primary(tokens, position):
         return ("WILDCARD", value), position + 1
     if kind == "PHRASE":
         return ("PHRASE", value), position + 1
+    if kind == "NEAR":
+        return ("NEAR", value), position + 1
     if kind == "LPAREN":
         node, position = _parse_search_or(tokens, position + 1)
         if position >= len(tokens) or tokens[position][0] != "RPAREN":
@@ -172,6 +262,41 @@ def _parse_search_primary(tokens, position):
     if kind == "RPAREN":
         raise ValueError("unbalanced parentheses in search expression")
     raise ValueError(f"missing operand in search expression before {kind}")
+
+
+def _make_search_evaluator(documents: dict[str, str], postings: dict[str, dict[str, int]],
+                           universe: set[str]):
+    """Build the recursive evaluator shared by ``search`` and ``bm25``."""
+
+    def evaluate(node) -> set[str]:
+        kind = node[0]
+        if kind == "TERM":
+            return set(postings.get(node[1], {}))
+        if kind == "WILDCARD":
+            matcher = _compile_pattern(node[1])
+            return {doc_id for term, entries in postings.items() if matcher(term)
+                    for doc_id in entries}
+        if kind == "PHRASE":
+            return {doc_id for doc_id, text in documents.items()
+                    if _sequence_starts(tokenize(text), node[1])}
+        if kind == "NEAR":
+            left_tokens, right_tokens, max_gap = node[1]
+            return {doc_id for doc_id, text in documents.items()
+                    if _near_occurrences(tokenize(text), left_tokens, right_tokens, max_gap)}
+        if kind == "AND":
+            return evaluate(node[1]) & evaluate(node[2])
+        if kind == "OR":
+            return evaluate(node[1]) | evaluate(node[2])
+        return universe - evaluate(node[1])
+
+    return evaluate
+
+
+def _parse_search_expression(expression: object):
+    """Validate (before any storage access) and parse a search/filter expression."""
+    if not isinstance(expression, str):
+        raise ValueError("expression must be a string")
+    return _parse_search(_lex_search(expression))
 
 
 class InvertedIndex:
@@ -409,17 +534,8 @@ class InvertedIndex:
         results = []
         for doc_id in sorted(documents):
             sequence = tokenize(documents[doc_id])
-            occurrences = []
-            for left_start in _sequence_starts(sequence, left_tokens):
-                left_end = left_start + len(left_tokens)
-                for right_start in _sequence_starts(sequence, right_tokens):
-                    right_end = right_start + len(right_tokens)
-                    if right_start >= left_end and right_start - left_end <= max_gap:
-                        occurrences.append([left_start, right_start])
-                    elif left_start >= right_end and left_start - right_end <= max_gap:
-                        occurrences.append([left_start, right_start])
+            occurrences = _near_occurrences(sequence, left_tokens, right_tokens, max_gap)
             if occurrences:
-                occurrences.sort()
                 results.append({"id": doc_id, "occurrences": occurrences})
         return results
 
@@ -427,44 +543,33 @@ class InvertedIndex:
         """Evaluate a boolean search expression and return matching document ids.
 
         The expression combines plain terms, wildcard terms, double-quoted
-        phrases, parentheses and the case-sensitive operators AND, OR, NOT;
-        precedence is NOT, then AND, then OR, with left-to-right associativity
-        at each level. An unquoted fragment containing ``*`` (zero or more
-        characters) or ``?`` (exactly one character) is a wildcard term that
-        hits every document containing at least one expanded term; it needs at
-        least one literal character. Terms hit documents containing the term,
-        phrases hit documents containing the consecutive token sequence (the
-        quoted text keeps ``tokenize`` semantics, wildcards are not special
-        there), AND/OR intersect/union the two sides and NOT complements
-        against every document in the index. Returns the matching document ids
-        sorted ascending; the index is only read, never written. Malformed
-        expressions raise ``ValueError``.
+        phrases, ``NEAR(...)`` atoms, parentheses and the case-sensitive
+        operators AND, OR, NOT; precedence is NOT, then AND, then OR, with
+        left-to-right associativity at each level. An unquoted fragment
+        containing ``*`` (zero or more characters) or ``?`` (exactly one
+        character) is a wildcard term that hits every document containing at
+        least one expanded term; it needs at least one literal character.
+        Terms hit documents containing the term, phrases hit documents
+        containing the consecutive token sequence (the quoted text keeps
+        ``tokenize`` semantics, wildcards are not special there), and a
+        ``NEAR("fragment", "fragment", gap)`` atom hits documents where the
+        two tokenised fragments occur consecutively, without overlapping and
+        in either order, with at most ``gap`` tokens strictly between them
+        (the same contract as :meth:`near`; wildcards inside the quoted
+        fragments are not expanded, commas and parens inside are text, and
+        the gap is an ASCII decimal integer from 0 through 2147483647 with
+        optional leading zeros). A standalone ``NEAR`` without a call stays a
+        plain term; the function name must be upper case. AND/OR intersect/
+        union the two sides and NOT complements against every document in the
+        index (including documents without tokens). Returns the matching
+        document ids sorted ascending; the index is only read, never written.
+        Malformed expressions raise ``ValueError`` before any storage access.
         """
-        if not isinstance(expression, str):
-            raise ValueError("expression must be a string")
-        tree = _parse_search(_lex_search(expression))
+        tree = _parse_search_expression(expression)
         snapshot = self._read()
         documents = snapshot["documents"]
         postings = snapshot["postings"]
-        universe = set(documents)
-
-        def evaluate(node) -> set[str]:
-            kind = node[0]
-            if kind == "TERM":
-                return set(postings.get(node[1], {}))
-            if kind == "WILDCARD":
-                matcher = _compile_pattern(node[1])
-                return {doc_id for term, entries in postings.items() if matcher(term)
-                        for doc_id in entries}
-            if kind == "PHRASE":
-                return {doc_id for doc_id, text in documents.items()
-                        if _sequence_starts(tokenize(text), node[1])}
-            if kind == "AND":
-                return evaluate(node[1]) & evaluate(node[2])
-            if kind == "OR":
-                return evaluate(node[1]) | evaluate(node[2])
-            return universe - evaluate(node[1])
-
+        evaluate = _make_search_evaluator(documents, postings, set(documents))
         return sorted(evaluate(tree))
 
     def rank(self, terms: list[str]) -> list[dict]:
@@ -519,9 +624,7 @@ class InvertedIndex:
             raise ValueError("b must be a finite number within [0, 1]")
         tree = None
         if expression is not None:
-            if not isinstance(expression, str):
-                raise ValueError("expression must be a string or None")
-            tree = _parse_search(_lex_search(expression))
+            tree = _parse_search_expression(expression)
         wanted = list(dict.fromkeys(term.lower() for term in terms))
         snapshot = self._read()
         documents = snapshot["documents"]
@@ -531,26 +634,7 @@ class InvertedIndex:
         total_length = sum(lengths.values())
         candidates: set[str] | None = None
         if tree is not None:
-            universe = set(documents)
-
-            def evaluate(node) -> set[str]:
-                kind = node[0]
-                if kind == "TERM":
-                    return set(postings.get(node[1], {}))
-                if kind == "WILDCARD":
-                    matcher = _compile_pattern(node[1])
-                    return {doc_id for term, entries in postings.items() if matcher(term)
-                            for doc_id in entries}
-                if kind == "PHRASE":
-                    return {doc_id for doc_id, text in documents.items()
-                            if _sequence_starts(tokenize(text), node[1])}
-                if kind == "AND":
-                    return evaluate(node[1]) & evaluate(node[2])
-                if kind == "OR":
-                    return evaluate(node[1]) | evaluate(node[2])
-                return universe - evaluate(node[1])
-
-            candidates = evaluate(tree)
+            candidates = _make_search_evaluator(documents, postings, set(documents))(tree)
         if n_docs == 0 or total_length == 0:
             return []
         avgdl = total_length / n_docs

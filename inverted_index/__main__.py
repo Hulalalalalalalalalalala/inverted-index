@@ -67,7 +67,7 @@ def _parser() -> argparse.ArgumentParser:
     near.add_argument("left")
     near.add_argument("right")
     near.add_argument("max_gap", type=int, help="maximum number of tokens strictly between the fragments")
-    search = sub.add_parser("search", help="evaluate a boolean expression of terms, wildcards, quoted phrases, AND, OR, NOT")
+    search = sub.add_parser("search", help="evaluate a boolean expression of terms, wildcards, quoted phrases, NEAR(...) atoms, AND, OR, NOT")
     search.add_argument("expression")
     expand = sub.add_parser("expand", help="list every term matching a wildcard pattern")
     expand.add_argument("pattern")
