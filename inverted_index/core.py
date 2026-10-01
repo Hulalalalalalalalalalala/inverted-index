@@ -120,6 +120,19 @@ class InvertedIndex:
         except OSError:
             pass
 
+    @staticmethod
+    def _index_text(document: dict, doc_id: str, text: str) -> None:
+        for token, frequency in Counter(tokenize(text)).items():
+            document["postings"].setdefault(token, {})[doc_id] = frequency
+
+    @staticmethod
+    def _drop_postings(document: dict, doc_id: str) -> None:
+        postings = document["postings"]
+        for token in list(postings):
+            postings[token].pop(doc_id, None)
+            if not postings[token]:
+                del postings[token]
+
     def add(self, doc_id: str, text: str) -> int:
         _require_non_empty_string(doc_id, "doc_id")
         _require_non_empty_string(text, "text")
@@ -127,8 +140,7 @@ class InvertedIndex:
         if doc_id in document["documents"]:
             raise ValueError(f"document {doc_id!r} already exists")
         document["documents"][doc_id] = text
-        for token, frequency in Counter(tokenize(text)).items():
-            document["postings"].setdefault(token, {})[doc_id] = frequency
+        self._index_text(document, doc_id, text)
         self._write(document)
         return len(document["documents"])
 
@@ -143,13 +155,8 @@ class InvertedIndex:
         if doc_id not in document["documents"]:
             raise KeyError(doc_id)
         document["documents"][doc_id] = text
-        postings = document["postings"]
-        for token in list(postings):
-            postings[token].pop(doc_id, None)
-            if not postings[token]:
-                del postings[token]
-        for token, frequency in Counter(tokenize(text)).items():
-            postings.setdefault(token, {})[doc_id] = frequency
+        self._drop_postings(document, doc_id)
+        self._index_text(document, doc_id, text)
         self._write(document)
         return len(document["documents"])
 
@@ -163,12 +170,66 @@ class InvertedIndex:
         if doc_id not in document["documents"]:
             return False
         del document["documents"][doc_id]
-        for token, postings in list(document["postings"].items()):
-            postings.pop(doc_id, None)
-            if not postings:
-                del document["postings"][token]
+        self._drop_postings(document, doc_id)
         self._write(document)
         return True
+
+    def apply(self, operations: list[dict]) -> list[int | bool]:
+        """Apply a non-empty batch of add/update/delete operations atomically.
+
+        Operations run in order on one in-memory snapshot, so later operations
+        see earlier ones (e.g. delete then add the same id), and the snapshot is
+        rewritten exactly once: any failure leaves the committed state untouched.
+        Each result mirrors the matching single-document call -- add and update
+        return the document total at that point, delete returns whether the id
+        existed. Within a batch an unknown update id is a ``ValueError`` (the
+        single ``update`` still raises ``KeyError``); deleting an unknown id
+        still returns ``False``.
+        """
+        if not isinstance(operations, list):
+            raise ValueError("operations must be a list of operation objects")
+        if not operations:
+            raise ValueError("operations must contain at least one operation")
+        document = self._read()
+        results: list[int | bool] = []
+        for position, operation in enumerate(operations):
+            label = f"operation {position}"
+            if not isinstance(operation, dict):
+                raise ValueError(f"{label}: each operation must be an object")
+            op = operation.get("op")
+            if op not in ("add", "update", "delete"):
+                raise ValueError(f"{label}: op must be one of add, update, delete")
+            allowed = {"op", "doc_id", "text"} if op != "delete" else {"op", "doc_id"}
+            if set(operation) != allowed:
+                raise ValueError(f"{label}: {op} allows exactly the fields {sorted(allowed)}")
+            doc_id = operation["doc_id"]
+            if not isinstance(doc_id, str) or not doc_id:
+                raise ValueError(f"{label}: doc_id must be a non-empty string")
+            if op != "delete":
+                text = operation["text"]
+                if not isinstance(text, str) or not text:
+                    raise ValueError(f"{label}: text must be a non-empty string")
+            if op == "add":
+                if doc_id in document["documents"]:
+                    raise ValueError(f"{label}: document {doc_id!r} already exists")
+                document["documents"][doc_id] = text
+                self._index_text(document, doc_id, text)
+                results.append(len(document["documents"]))
+            elif op == "update":
+                if doc_id not in document["documents"]:
+                    raise ValueError(f"{label}: document {doc_id!r} does not exist")
+                document["documents"][doc_id] = text
+                self._drop_postings(document, doc_id)
+                self._index_text(document, doc_id, text)
+                results.append(len(document["documents"]))
+            else:
+                existed = doc_id in document["documents"]
+                if existed:
+                    del document["documents"][doc_id]
+                    self._drop_postings(document, doc_id)
+                results.append(existed)
+        self._write(document)
+        return results
 
     def query(self, terms: list[str]) -> list[dict]:
         _require_terms(terms, "query")

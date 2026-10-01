@@ -14,7 +14,7 @@
 python3 -m inverted_index --root ./state init
 ```
 
-子命令：`init`、`add <doc_id> <text>`、`get <doc_id>`、`update <doc_id> <text>`、`delete <doc_id>`、`query <term> [term ...]`、`rank <term> [term ...]`、`phrase <text>`、`near <left> <right> <max_gap>`、`terms`、`stats`、`reload`、`report`。
+子命令：`init`、`add <doc_id> <text>`、`get <doc_id>`、`update <doc_id> <text>`、`delete <doc_id>`、`apply <operations>`、`query <term> [term ...]`、`rank <term> [term ...]`、`phrase <text>`、`near <left> <right> <max_gap>`、`terms`、`stats`、`reload`、`report`。`apply` 的参数是一个 JSON 数组文本，成功时标准输出一个 JSON 数组。
 
 ## 公开接口
 
@@ -25,6 +25,7 @@ python3 -m inverted_index --root ./state init
 - `get(doc_id) -> str | None` 取回原文档文本。
 - `update(doc_id, text) -> int` 替换已有文档的原文并重建其倒排项、词频与位置，文档总数不变，返回替换后的总数；目标文档不存在抛出 `KeyError`，`doc_id`/`text` 为空或非字符串抛出 `ValueError`。
 - `delete(doc_id) -> bool` 删除文档并清掉它的倒排项。
+- `apply(operations) -> list[int | bool]` 原子批量写入：`operations` 是非空 JSON 风格对象数组，按数组顺序在同一快照上执行，整批只落盘一次；后项可见前项结果（如先 delete 再 add、先 add 再 update 同一 id）。每个对象 `op` 只能是 `add`、`update`、`delete`，`doc_id` 必须是非空字符串；`add`/`update` 必须且只能再提供非空字符串 `text`，`delete` 不提供 `text`，其余字段一律拒绝。返回值逐元素对应：`add`/`update` 返回执行到该步时的文档总数，`delete` 返回该 id 当时是否存在（不存在为 `false`，与单文档 `delete` 语义一致）。空数组、元素不是对象、`op` 未知、字段缺失或多余、`doc_id`/`text` 类型错误，以及批次中 `add` 已存在或 `update` 不存在，均抛出 `ValueError`（单独调用 `update` 不存在仍抛 `KeyError`）；任一操作失败时已提交状态保持不变。
 - `query(terms) -> list[dict]` 返回同时包含全部词项的文档，按 `(命中词项数, doc_id)` 稳定排序。
 - `rank(terms) -> list[dict]` 按 TF-IDF 求和打分，返回 `{id, matched, score}`，按 `(score 降序, id 升序)` 排序。
 - `phrase(text) -> list[dict]` 精确短语检索：返回 `{id, positions}`，按文档 id 升序；positions 是短语首个词项在文档词项序列中的从 0 开始位置，升序，重复出现保留多个位置。
