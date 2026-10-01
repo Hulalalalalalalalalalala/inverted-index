@@ -39,6 +39,13 @@ def _require_terms(terms: object, name: str) -> None:
         raise ValueError(f"{name} needs non-empty string terms")
 
 
+def _sequence_starts(sequence: list[str], fragment: list[str]) -> list[int]:
+    """All 0-based starts where ``fragment`` occurs consecutively in ``sequence``."""
+    length = len(fragment)
+    return [start for start in range(len(sequence) - length + 1)
+            if sequence[start:start + length] == fragment]
+
+
 class InvertedIndex:
     """A single-process inverted index rooted at ``root``."""
 
@@ -186,10 +193,45 @@ class InvertedIndex:
         results = []
         for doc_id in sorted(documents):
             sequence = tokenize(documents[doc_id])
-            positions = [start for start in range(len(sequence) - len(tokens) + 1)
-                         if sequence[start:start + len(tokens)] == tokens]
+            positions = _sequence_starts(sequence, tokens)
             if positions:
                 results.append({"id": doc_id, "positions": positions})
+        return results
+
+    def near(self, left: str, right: str, max_gap: int) -> list[dict]:
+        """Find documents where the token sequences of ``left`` and ``right`` are close.
+
+        Either fragment may occur first; each must be a consecutive, non-overlapping
+        match. ``max_gap`` bounds the number of tokens strictly between the two
+        fragments. Returns ``[{"id": doc_id, "occurrences": [[left_start, right_start], ...]}, ...]``
+        sorted by document id; each pair gives the 0-based starts of the left and
+        right fragment's first token (fields stay fixed even when right comes first),
+        sorted by ``(left_start, right_start)`` with repeats kept.
+        """
+        if not isinstance(left, str) or not isinstance(right, str):
+            raise ValueError("near fragments must be strings")
+        if isinstance(max_gap, bool) or not isinstance(max_gap, int) or max_gap < 0:
+            raise ValueError("max_gap must be a non-negative integer")
+        left_tokens = tokenize(left)
+        right_tokens = tokenize(right)
+        if not left_tokens or not right_tokens:
+            raise ValueError("near fragments need at least one token each")
+        documents = self._read()["documents"]
+        results = []
+        for doc_id in sorted(documents):
+            sequence = tokenize(documents[doc_id])
+            occurrences = []
+            for left_start in _sequence_starts(sequence, left_tokens):
+                left_end = left_start + len(left_tokens)
+                for right_start in _sequence_starts(sequence, right_tokens):
+                    right_end = right_start + len(right_tokens)
+                    if right_start >= left_end and right_start - left_end <= max_gap:
+                        occurrences.append([left_start, right_start])
+                    elif left_start >= right_end and left_start - right_end <= max_gap:
+                        occurrences.append([left_start, right_start])
+            if occurrences:
+                occurrences.sort()
+                results.append({"id": doc_id, "occurrences": occurrences})
         return results
 
     def rank(self, terms: list[str]) -> list[dict]:

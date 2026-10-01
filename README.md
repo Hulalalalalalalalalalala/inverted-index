@@ -14,7 +14,7 @@
 python3 -m inverted_index --root ./state init
 ```
 
-子命令：`init`、`add <doc_id> <text>`、`get <doc_id>`、`update <doc_id> <text>`、`delete <doc_id>`、`query <term> [term ...]`、`rank <term> [term ...]`、`phrase <text>`、`terms`、`stats`、`reload`、`report`。
+子命令：`init`、`add <doc_id> <text>`、`get <doc_id>`、`update <doc_id> <text>`、`delete <doc_id>`、`query <term> [term ...]`、`rank <term> [term ...]`、`phrase <text>`、`near <left> <right> <max_gap>`、`terms`、`stats`、`reload`、`report`。
 
 ## 公开接口
 
@@ -28,6 +28,7 @@ python3 -m inverted_index --root ./state init
 - `query(terms) -> list[dict]` 返回同时包含全部词项的文档，按 `(命中词项数, doc_id)` 稳定排序。
 - `rank(terms) -> list[dict]` 按 TF-IDF 求和打分，返回 `{id, matched, score}`，按 `(score 降序, id 升序)` 排序。
 - `phrase(text) -> list[dict]` 精确短语检索：返回 `{id, positions}`，按文档 id 升序；positions 是短语首个词项在文档词项序列中的从 0 开始位置，升序，重复出现保留多个位置。
+- `near(left, right, max_gap) -> list[dict]` 相邻短语近邻检索：两片段按现有 `tokenize` 语义分词，`max_gap` 为非负整数，限定两片段间严格夹着的词项数上限；两片段可任意先后出现，各自连续且不重叠。返回 `{id, occurrences}`，按文档 id 升序；occurrences 为 `[left_start, right_start]` 对（right 先出现时字段仍按左右对应），按 `(left_start, right_start)` 升序，重复位置组合全部保留，未命中文档不出现。任一片段分词后为空，或 `max_gap` 为布尔值、负数、非整数时抛出 `ValueError`。
 - `terms() -> list[str]` 升序返回全部词项。
 - `stats() -> dict` 返回文档数、词项数与倒排项数。
 - `reload() -> None` 从落盘的索引快照重新载入。
