@@ -61,6 +61,8 @@ def _parser() -> argparse.ArgumentParser:
     near.add_argument("left")
     near.add_argument("right")
     near.add_argument("max_gap", type=int, help="maximum number of tokens strictly between the fragments")
+    search = sub.add_parser("search", help="evaluate a boolean expression of terms, phrases, AND, OR, NOT")
+    search.add_argument("expression")
     sub.add_parser("terms", help="list every term")
     sub.add_parser("stats", help="print document, term and posting counts")
     sub.add_parser("reload", help="reload the index snapshot")
@@ -93,6 +95,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(index.phrase(args.text), ensure_ascii=False))
         elif args.command == "near":
             print(json.dumps(index.near(args.left, args.right, args.max_gap), ensure_ascii=False))
+        elif args.command == "search":
+            print(json.dumps(index.search(args.expression), ensure_ascii=False))
         elif args.command == "terms":
             print(json.dumps(index.terms()))
         elif args.command == "stats":
@@ -100,8 +104,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "reload":
             index.reload(); print("ok")
         elif args.command == "report":
-            print(_report(["postings", "tokenizer", "near"],
-                          {"add": True, "query": True, "delete": True, "ranking": True, "near": True}))
+            print(_report(["postings", "tokenizer", "near", "search"],
+                          {"add": True, "query": True, "delete": True, "ranking": True, "near": True,
+                           "search": True}))
         return 0
     except SnapshotError as error:
         print(f"error: {error}", file=sys.stderr)

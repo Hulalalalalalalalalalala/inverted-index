@@ -46,6 +46,103 @@ def _sequence_starts(sequence: list[str], fragment: list[str]) -> list[int]:
             if sequence[start:start + length] == fragment]
 
 
+_SEARCH_WORD = re.compile(r"[0-9A-Za-z_]+")
+_SEARCH_OPERATORS = {"AND": "and", "OR": "or", "NOT": "not"}
+
+
+def _lex_search(expression: str) -> list[tuple]:
+    """Split a search expression into tokens; operators and parentheses are case-sensitive."""
+    tokens: list[tuple] = []
+    position = 0
+    while position < len(expression):
+        char = expression[position]
+        if char.isspace():
+            position += 1
+            continue
+        if char == "(":
+            tokens.append(("lparen", None))
+            position += 1
+            continue
+        if char == ")":
+            tokens.append(("rparen", None))
+            position += 1
+            continue
+        if char == '"':
+            end = expression.find('"', position + 1)
+            if end < 0:
+                raise ValueError("search expression has an unclosed quote")
+            terms = tokenize(expression[position + 1:end])
+            if not terms:
+                raise ValueError("search phrase needs at least one token")
+            tokens.append(("phrase", terms))
+            position = end + 1
+            continue
+        match = _SEARCH_WORD.match(expression, position)
+        if match is None:
+            raise ValueError(f"unsupported character {char!r} in search expression")
+        word = match.group(0)
+        if word in _SEARCH_OPERATORS:
+            tokens.append((_SEARCH_OPERATORS[word], None))
+        else:
+            tokens.append(("term", word.lower()))
+        position = match.end()
+    return tokens
+
+
+def _parse_search(tokens: list[tuple]) -> tuple:
+    """Parse lexed tokens into an AST: NOT binds tightest, then AND, then OR; same-level is left-associative."""
+    position = 0
+
+    def peek() -> str | None:
+        return tokens[position][0] if position < len(tokens) else None
+
+    def parse_or() -> tuple:
+        nonlocal position
+        node = parse_and()
+        while peek() == "or":
+            position += 1
+            node = ("or", node, parse_and())
+        return node
+
+    def parse_and() -> tuple:
+        nonlocal position
+        node = parse_not()
+        while peek() == "and":
+            position += 1
+            node = ("and", node, parse_not())
+        return node
+
+    def parse_not() -> tuple:
+        nonlocal position
+        if peek() == "not":
+            position += 1
+            return ("not", parse_not())
+        return parse_primary()
+
+    def parse_primary() -> tuple:
+        nonlocal position
+        kind = peek()
+        if kind in ("term", "phrase"):
+            node = tokens[position]
+            position += 1
+            return node
+        if kind == "lparen":
+            position += 1
+            node = parse_or()
+            if peek() != "rparen":
+                raise ValueError("search expression has unbalanced parentheses")
+            position += 1
+            return node
+        raise ValueError("search expression is missing an operand")
+
+    tree = parse_or()
+    if position != len(tokens):
+        if tokens[position][0] == "rparen":
+            raise ValueError("search expression has unbalanced parentheses")
+        raise ValueError("search expression needs AND or OR between operands")
+    return tree
+
+
 class InvertedIndex:
     """A single-process inverted index rooted at ``root``."""
 
@@ -294,6 +391,49 @@ class InvertedIndex:
                 occurrences.sort()
                 results.append({"id": doc_id, "occurrences": occurrences})
         return results
+
+    def search(self, expression: str) -> list[str]:
+        """Evaluate a boolean search expression and return matching document ids.
+
+        The expression is a single string of plain terms, double-quoted phrases,
+        parentheses and the case-sensitive operators AND, OR and NOT. Plain terms
+        are runs of ASCII letters, digits or underscores, lower-cased like
+        ``tokenize``; phrases keep ``phrase``'s consecutive-token meaning. NOT
+        binds tighter than AND, AND tighter than OR, and same-level operators
+        associate left to right. AND intersects, OR unions, and NOT complements
+        against every document in the index. The result is the sorted list of
+        matching document ids (no counts or scores); an empty list means no hits.
+        Malformed expressions raise ``ValueError``.
+        """
+        if not isinstance(expression, str) or not expression.strip():
+            raise ValueError("search expression must be a non-empty string")
+        tree = _parse_search(_lex_search(expression))
+        snapshot = self._read()
+        documents = snapshot["documents"]
+        postings = snapshot["postings"]
+        universe = set(documents)
+        sequences: dict[str, list[str]] = {}
+
+        def sequence(doc_id: str) -> list[str]:
+            if doc_id not in sequences:
+                sequences[doc_id] = tokenize(documents[doc_id])
+            return sequences[doc_id]
+
+        def evaluate(node: tuple) -> set[str]:
+            kind = node[0]
+            if kind == "term":
+                return set(postings.get(node[1], {}))
+            if kind == "phrase":
+                terms = node[1]
+                return {doc_id for doc_id in documents
+                        if _sequence_starts(sequence(doc_id), terms)}
+            if kind == "not":
+                return universe - evaluate(node[1])
+            left = evaluate(node[1])
+            right = evaluate(node[2])
+            return left & right if kind == "and" else left | right
+
+        return sorted(evaluate(tree))
 
     def rank(self, terms: list[str]) -> list[dict]:
         """Score documents against ``terms`` with a tf-idf sum, best first."""
