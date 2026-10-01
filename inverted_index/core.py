@@ -120,26 +120,17 @@ class InvertedIndex:
         except OSError:
             pass
 
-    def add(self, doc_id: str, text: str) -> int:
-        _require_non_empty_string(doc_id, "doc_id")
-        _require_non_empty_string(text, "text")
-        document = self._read()
+    @staticmethod
+    def _add_document(document: dict, doc_id: str, text: str) -> int:
         if doc_id in document["documents"]:
             raise ValueError(f"document {doc_id!r} already exists")
         document["documents"][doc_id] = text
         for token, frequency in Counter(tokenize(text)).items():
             document["postings"].setdefault(token, {})[doc_id] = frequency
-        self._write(document)
         return len(document["documents"])
 
-    def update(self, doc_id: str, text: str) -> int:
-        """Replace ``doc_id``'s text and rebuild its postings, frequencies and positions.
-
-        The document count is unchanged; the new total is returned.
-        """
-        _require_non_empty_string(doc_id, "doc_id")
-        _require_non_empty_string(text, "text")
-        document = self._read()
+    @staticmethod
+    def _update_document(document: dict, doc_id: str, text: str) -> int:
         if doc_id not in document["documents"]:
             raise KeyError(doc_id)
         document["documents"][doc_id] = text
@@ -150,8 +141,38 @@ class InvertedIndex:
                 del postings[token]
         for token, frequency in Counter(tokenize(text)).items():
             postings.setdefault(token, {})[doc_id] = frequency
-        self._write(document)
         return len(document["documents"])
+
+    @staticmethod
+    def _delete_document(document: dict, doc_id: str) -> bool:
+        if doc_id not in document["documents"]:
+            return False
+        del document["documents"][doc_id]
+        for token, postings in list(document["postings"].items()):
+            postings.pop(doc_id, None)
+            if not postings:
+                del document["postings"][token]
+        return True
+
+    def add(self, doc_id: str, text: str) -> int:
+        _require_non_empty_string(doc_id, "doc_id")
+        _require_non_empty_string(text, "text")
+        document = self._read()
+        result = self._add_document(document, doc_id, text)
+        self._write(document)
+        return result
+
+    def update(self, doc_id: str, text: str) -> int:
+        """Replace ``doc_id``'s text and rebuild its postings, frequencies and positions.
+
+        The document count is unchanged; the new total is returned.
+        """
+        _require_non_empty_string(doc_id, "doc_id")
+        _require_non_empty_string(text, "text")
+        document = self._read()
+        result = self._update_document(document, doc_id, text)
+        self._write(document)
+        return result
 
     def get(self, doc_id: str) -> str | None:
         _require_non_empty_string(doc_id, "doc_id")
@@ -160,15 +181,67 @@ class InvertedIndex:
     def delete(self, doc_id: str) -> bool:
         _require_non_empty_string(doc_id, "doc_id")
         document = self._read()
-        if doc_id not in document["documents"]:
-            return False
-        del document["documents"][doc_id]
-        for token, postings in list(document["postings"].items()):
-            postings.pop(doc_id, None)
-            if not postings:
-                del document["postings"][token]
+        result = self._delete_document(document, doc_id)
         self._write(document)
-        return True
+        return result
+
+    @staticmethod
+    def _parse_operation(operation: object, index: int) -> tuple[str, str, str | None]:
+        """Validate one batch element's shape, types and field set."""
+        label = f"operation {index}"
+        if not isinstance(operation, dict):
+            raise ValueError(f"{label} must be an object")
+        op = operation.get("op")
+        if op not in ("add", "update", "delete"):
+            raise ValueError(f"{label} has an unknown op {op!r}; expected add, update or delete")
+        expected = {"op", "doc_id"} if op == "delete" else {"op", "doc_id", "text"}
+        keys = set(operation)
+        if keys != expected:
+            details = []
+            if expected - keys:
+                details.append(f"missing {sorted(expected - keys)}")
+            if keys - expected:
+                details.append(f"unexpected {sorted(keys - expected)}")
+            raise ValueError(f"{label} has invalid fields ({'; '.join(details)})")
+        doc_id = operation["doc_id"]
+        if not isinstance(doc_id, str) or not doc_id:
+            raise ValueError(f"{label} doc_id must be a non-empty string")
+        text = operation.get("text")
+        if op != "delete" and (not isinstance(text, str) or not text):
+            raise ValueError(f"{label} text must be a non-empty string")
+        return op, doc_id, text
+
+    def apply(self, operations: list[dict]) -> list[int | bool]:
+        """Run add/update/delete operations in order and commit them as one batch.
+
+        Returns one result per operation: the post-operation document count for
+        ``add``, the unchanged count for ``update``, and a boolean for ``delete``
+        (``False`` for an unknown id). Every element is validated and applied in
+        sequence against the same in-memory snapshot, so later operations see the
+        effects of earlier ones; the snapshot is written exactly once. Any error
+        leaves the persisted state untouched. Structural problems and, within the
+        batch, adds of existing documents or updates of missing ones raise
+        ``ValueError``.
+        """
+        if not isinstance(operations, list):
+            raise ValueError("operations must be a list")
+        if not operations:
+            raise ValueError("operations must not be empty")
+        document = self._read()
+        results: list[int | bool] = []
+        for index, operation in enumerate(operations):
+            op, doc_id, text = self._parse_operation(operation, index)
+            if op == "add":
+                results.append(self._add_document(document, doc_id, text))
+            elif op == "update":
+                try:
+                    results.append(self._update_document(document, doc_id, text))
+                except KeyError:
+                    raise ValueError(f"operation {index} updates missing document {doc_id!r}") from None
+            else:
+                results.append(self._delete_document(document, doc_id))
+        self._write(document)
+        return results
 
     def query(self, terms: list[str]) -> list[dict]:
         _require_terms(terms, "query")

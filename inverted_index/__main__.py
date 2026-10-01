@@ -52,6 +52,8 @@ def _parser() -> argparse.ArgumentParser:
     get = sub.add_parser("get"); get.add_argument("doc_id")
     update = sub.add_parser("update", help="replace a document's text"); update.add_argument("doc_id"); update.add_argument("text")
     delete = sub.add_parser("delete"); delete.add_argument("doc_id")
+    apply_cmd = sub.add_parser("apply", help="atomically commit a JSON array of add/update/delete operations")
+    apply_cmd.add_argument("operations", help="JSON array text, e.g. '[{\"op\": \"add\", \"doc_id\": \"d1\", \"text\": \"...\"}]'")
     query = sub.add_parser("query"); query.add_argument("terms", nargs="+")
     rank = sub.add_parser("rank", help="score documents against terms"); rank.add_argument("terms", nargs="+")
     phrase = sub.add_parser("phrase", help="find documents containing an exact token sequence"); phrase.add_argument("text")
@@ -80,6 +82,9 @@ def main(argv: list[str] | None = None) -> int:
             print(index.update(args.doc_id, args.text))
         elif args.command == "delete":
             print("true" if index.delete(args.doc_id) else "false")
+        elif args.command == "apply":
+            operations = json.loads(args.operations)
+            print(json.dumps(index.apply(operations)))
         elif args.command == "query":
             print(json.dumps(index.query(args.terms), ensure_ascii=False))
         elif args.command == "rank":
