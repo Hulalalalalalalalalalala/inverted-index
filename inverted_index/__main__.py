@@ -56,6 +56,12 @@ def _parser() -> argparse.ArgumentParser:
     apply_cmd.add_argument("operations", help="a JSON array of operation objects")
     query = sub.add_parser("query"); query.add_argument("terms", nargs="+")
     rank = sub.add_parser("rank", help="score documents against terms"); rank.add_argument("terms", nargs="+")
+    bm25 = sub.add_parser("bm25", help="score documents against terms with BM25")
+    bm25.add_argument("terms", nargs="+")
+    bm25.add_argument("--filter", dest="expression", default=None,
+                      help="optional boolean filter expression (same syntax as search)")
+    bm25.add_argument("--k1", type=float, default=1.2, help="BM25 k1 (finite positive number)")
+    bm25.add_argument("--b", type=float, default=0.75, help="BM25 b (a number within [0, 1])")
     phrase = sub.add_parser("phrase", help="find documents containing an exact token sequence"); phrase.add_argument("text")
     near = sub.add_parser("near", help="find documents where two token fragments occur close together")
     near.add_argument("left")
@@ -93,6 +99,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(index.query(args.terms), ensure_ascii=False))
         elif args.command == "rank":
             print(json.dumps(index.rank(args.terms), ensure_ascii=False))
+        elif args.command == "bm25":
+            print(json.dumps(index.bm25(args.terms, args.expression, args.k1, args.b), ensure_ascii=False))
         elif args.command == "phrase":
             print(json.dumps(index.phrase(args.text), ensure_ascii=False))
         elif args.command == "near":

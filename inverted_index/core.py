@@ -489,6 +489,90 @@ class InvertedIndex:
         results.sort(key=lambda item: (-item["score"], item["id"]))
         return results
 
+    def bm25(self, terms: list[str], expression: str | None = None,
+             k1: float = 1.2, b: float = 0.75) -> list[dict]:
+        """Score documents against ``terms`` with BM25, best first.
+
+        Terms are only lower-cased and de-duplicated -- never tokenised or
+        wildcard-expanded. ``N`` is every document in the index (including
+        documents without tokens), ``dl`` a document's token count,
+        ``avgdl`` the mean ``dl`` over all documents, ``df`` the number of
+        documents containing a term and ``tf`` its frequency in a document.
+        Each matched term contributes
+        ``ln(1 + (N - df + 0.5) / (df + 0.5)) * tf * (k1 + 1)
+        / (tf + k1 * (1 - b + b * dl / avgdl))``; statistics always cover the
+        whole index, while ``expression``, using the full :meth:`search`
+        syntax (``None`` means no filter), only restricts which documents are
+        returned. Every returned document matches at least one term and the
+        filter; items are ``{"id", "matched", "score"}`` with ``matched`` the
+        number of distinct matched terms, sorted by rounded score descending
+        then id ascending. Read-only; raises ``ValueError`` for bad terms,
+        ``k1``/``b`` or an invalid expression, even when nothing could match.
+        """
+        if not isinstance(terms, list) or not terms:
+            raise ValueError("bm25 needs a non-empty list of terms")
+        if any(not isinstance(term, str) or not term for term in terms):
+            raise ValueError("bm25 terms must be non-empty strings")
+        if isinstance(k1, bool) or not isinstance(k1, (int, float)) or not math.isfinite(k1) or k1 <= 0:
+            raise ValueError("k1 must be a finite positive number")
+        if isinstance(b, bool) or not isinstance(b, (int, float)) or not math.isfinite(b) or not 0 <= b <= 1:
+            raise ValueError("b must be a finite number within [0, 1]")
+        tree = None
+        if expression is not None:
+            if not isinstance(expression, str):
+                raise ValueError("expression must be a string or None")
+            tree = _parse_search(_lex_search(expression))
+        wanted = list(dict.fromkeys(term.lower() for term in terms))
+        snapshot = self._read()
+        documents = snapshot["documents"]
+        postings = snapshot["postings"]
+        n_docs = len(documents)
+        lengths = {doc_id: len(tokenize(text)) for doc_id, text in documents.items()}
+        total_length = sum(lengths.values())
+        candidates: set[str] | None = None
+        if tree is not None:
+            universe = set(documents)
+
+            def evaluate(node) -> set[str]:
+                kind = node[0]
+                if kind == "TERM":
+                    return set(postings.get(node[1], {}))
+                if kind == "WILDCARD":
+                    matcher = _compile_pattern(node[1])
+                    return {doc_id for term, entries in postings.items() if matcher(term)
+                            for doc_id in entries}
+                if kind == "PHRASE":
+                    return {doc_id for doc_id, text in documents.items()
+                            if _sequence_starts(tokenize(text), node[1])}
+                if kind == "AND":
+                    return evaluate(node[1]) & evaluate(node[2])
+                if kind == "OR":
+                    return evaluate(node[1]) | evaluate(node[2])
+                return universe - evaluate(node[1])
+
+            candidates = evaluate(tree)
+        if n_docs == 0 or total_length == 0:
+            return []
+        avgdl = total_length / n_docs
+        scored: dict[str, dict] = {}
+        for term in wanted:
+            entries = postings.get(term, {})
+            df = len(entries)
+            idf = math.log1p((n_docs - df + 0.5) / (df + 0.5))
+            for doc_id, tf in entries.items():
+                if candidates is not None and doc_id not in candidates:
+                    continue
+                dl = lengths[doc_id]
+                denominator = tf + k1 * (1 - b + b * dl / avgdl)
+                contribution = idf * tf * (k1 + 1) / denominator
+                hit = scored.setdefault(doc_id, {"matched": 0, "score": 0.0})
+                hit["matched"] += 1
+                hit["score"] += contribution
+        results = [{"id": doc_id, "matched": hit["matched"], "score": round(hit["score"], 6)}
+                   for doc_id, hit in scored.items()]
+        results.sort(key=lambda item: (-item["score"], item["id"]))
+        return results
+
     def expand(self, pattern: str) -> list[str]:
         """List every indexed term matching the wildcard ``pattern``.
 
