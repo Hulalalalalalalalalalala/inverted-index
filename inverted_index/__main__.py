@@ -55,6 +55,8 @@ def _parser() -> argparse.ArgumentParser:
     query = sub.add_parser("query"); query.add_argument("terms", nargs="+")
     rank = sub.add_parser("rank", help="score documents against terms"); rank.add_argument("terms", nargs="+")
     phrase = sub.add_parser("phrase", help="find documents containing an exact token sequence"); phrase.add_argument("text")
+    near = sub.add_parser("near", help="find documents where two token sequences occur within max_gap tokens")
+    near.add_argument("left"); near.add_argument("right"); near.add_argument("max_gap", type=int)
     sub.add_parser("terms", help="list every term")
     sub.add_parser("stats", help="print document, term and posting counts")
     sub.add_parser("reload", help="reload the index snapshot")
@@ -82,6 +84,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(index.rank(args.terms), ensure_ascii=False))
         elif args.command == "phrase":
             print(json.dumps(index.phrase(args.text), ensure_ascii=False))
+        elif args.command == "near":
+            print(json.dumps(index.near(args.left, args.right, args.max_gap), ensure_ascii=False))
         elif args.command == "terms":
             print(json.dumps(index.terms()))
         elif args.command == "stats":
@@ -89,7 +93,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "reload":
             index.reload(); print("ok")
         elif args.command == "report":
-            print(_report(["postings", "tokenizer"], {"add": True, "query": True, "delete": True, "ranking": True}))
+            print(_report(["postings", "tokenizer", "near"], {"add": True, "query": True, "delete": True, "ranking": True, "near": True}))
         return 0
     except SnapshotError as error:
         print(f"error: {error}", file=sys.stderr)

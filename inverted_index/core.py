@@ -192,6 +192,51 @@ class InvertedIndex:
                 results.append({"id": doc_id, "positions": positions})
         return results
 
+    def near(self, left: str, right: str, max_gap: int) -> list[dict]:
+        """Find documents where the token sequences of ``left`` and ``right`` occur close together.
+
+        Each side must occur consecutively; the two segments may appear in either
+        order but must not overlap, and at most ``max_gap`` tokens may sit strictly
+        between them. Returns ``[{"id": doc_id, "occurrences": [[left_start,
+        right_start], ...]}, ...]`` sorted by document id; starts are 0-based
+        positions of each side's first token (left/right fields keep their meaning
+        even when ``right`` comes first), occurrences are sorted by left_start then
+        right_start, and every matching position combination is kept.
+        """
+        left_tokens = tokenize(left)
+        right_tokens = tokenize(right)
+        if not left_tokens:
+            raise ValueError("left needs at least one token")
+        if not right_tokens:
+            raise ValueError("right needs at least one token")
+        if isinstance(max_gap, bool) or not isinstance(max_gap, int) or max_gap < 0:
+            raise ValueError("max_gap must be a non-negative integer")
+        documents = self._read()["documents"]
+        results = []
+        for doc_id in sorted(documents):
+            sequence = tokenize(documents[doc_id])
+            left_starts = [start for start in range(len(sequence) - len(left_tokens) + 1)
+                           if sequence[start:start + len(left_tokens)] == left_tokens]
+            right_starts = [start for start in range(len(sequence) - len(right_tokens) + 1)
+                            if sequence[start:start + len(right_tokens)] == right_tokens]
+            occurrences = []
+            for left_start in left_starts:
+                left_end = left_start + len(left_tokens)
+                for right_start in right_starts:
+                    right_end = right_start + len(right_tokens)
+                    if left_end <= right_start:
+                        gap = right_start - left_end
+                    elif right_end <= left_start:
+                        gap = left_start - right_end
+                    else:
+                        continue  # overlapping segments
+                    if gap <= max_gap:
+                        occurrences.append([left_start, right_start])
+            if occurrences:
+                occurrences.sort()
+                results.append({"id": doc_id, "occurrences": occurrences})
+        return results
+
     def rank(self, terms: list[str]) -> list[dict]:
         """Score documents against ``terms`` with a tf-idf sum, best first."""
         _require_terms(terms, "rank")
