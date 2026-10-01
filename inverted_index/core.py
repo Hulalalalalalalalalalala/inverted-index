@@ -14,6 +14,8 @@ __all__ = ["InvertedIndex", "SnapshotError", "tokenize"]
 
 INDEX_FILE = "index.json"
 TOKEN = re.compile(r"[0-9A-Za-z_]+")
+FRAGMENT = re.compile(r"[0-9A-Za-z_*?]+")
+_PATTERN_CHARS = re.compile(r"[0-9A-Za-z_*?]+\Z")
 
 
 class SnapshotError(ValueError):
@@ -25,6 +27,26 @@ def tokenize(text: str) -> list[str]:
     if not isinstance(text, str):
         raise ValueError("text must be a string")
     return [match.group(0).lower() for match in TOKEN.finditer(text)]
+
+
+def _compile_pattern(pattern: str):
+    """Validate a wildcard pattern and return a full-match predicate over terms.
+
+    The pattern is lower-cased like any term; only ASCII letters, digits,
+    underscore and the wildcards ``*`` (zero or more characters) and ``?``
+    (exactly one character) are allowed -- anything else, an empty pattern or
+    a non-string raises ``ValueError``.
+    """
+    if not isinstance(pattern, str):
+        raise ValueError("pattern must be a string")
+    if not pattern:
+        raise ValueError("pattern must not be empty")
+    if not _PATTERN_CHARS.match(pattern):
+        raise ValueError(f"pattern contains unsupported characters: {pattern!r}")
+    lowered = pattern.lower()
+    regex = "".join(".*" if char == "*" else "." if char == "?" else re.escape(char)
+                    for char in lowered)
+    return re.compile(regex + r"\Z").match
 
 
 def _require_non_empty_string(value: object, name: str) -> None:
@@ -52,10 +74,11 @@ _SEARCH_OPERATORS = ("AND", "OR", "NOT")
 def _lex_search(expression: str) -> list[tuple[str, object]]:
     """Split a search expression into ``(kind, value)`` tokens.
 
-    Kinds are ``TERM`` (value the lower-cased term), ``PHRASE`` (value the
-    tokenised phrase), ``LPAREN``, ``RPAREN`` and the operators themselves.
-    Operators are case-sensitive; anything outside terms, quotes, parentheses
-    and whitespace is rejected.
+    Kinds are ``TERM`` (value the lower-cased term), ``WILDCARD`` (value the
+    lower-cased pattern), ``PHRASE`` (value the tokenised phrase), ``LPAREN``,
+    ``RPAREN`` and the operators themselves. Operators are case-sensitive;
+    anything outside terms, wildcards, quotes, parentheses and whitespace is
+    rejected. A wildcard fragment needs at least one literal character.
     """
     tokens: list[tuple[str, object]] = []
     position = 0
@@ -79,12 +102,16 @@ def _lex_search(expression: str) -> list[tuple[str, object]]:
             tokens.append(("PHRASE", phrase_tokens))
             position = end + 1
         else:
-            match = TOKEN.match(expression, position)
+            match = FRAGMENT.match(expression, position)
             if match is None:
                 raise ValueError(f"unsupported character {char!r} in search expression")
             word = match.group(0)
             if word in _SEARCH_OPERATORS:
                 tokens.append((word, word))
+            elif "*" in word or "?" in word:
+                if all(char in "*?" for char in word):
+                    raise ValueError("wildcard term needs at least one literal character")
+                tokens.append(("WILDCARD", word.lower()))
             else:
                 tokens.append(("TERM", word.lower()))
             position = match.end()
@@ -133,6 +160,8 @@ def _parse_search_primary(tokens, position):
     kind, value = tokens[position]
     if kind == "TERM":
         return ("TERM", value), position + 1
+    if kind == "WILDCARD":
+        return ("WILDCARD", value), position + 1
     if kind == "PHRASE":
         return ("PHRASE", value), position + 1
     if kind == "LPAREN":
@@ -397,14 +426,19 @@ class InvertedIndex:
     def search(self, expression: str) -> list[str]:
         """Evaluate a boolean search expression and return matching document ids.
 
-        The expression combines plain terms, double-quoted phrases, parentheses
-        and the case-sensitive operators AND, OR, NOT; precedence is NOT, then
-        AND, then OR, with left-to-right associativity at each level. Terms hit
-        documents containing the term, phrases hit documents containing the
-        consecutive token sequence, AND/OR intersect/union the two sides and
-        NOT complements against every document in the index. Returns the
-        matching document ids sorted ascending; the index is only read, never
-        written. Malformed expressions raise ``ValueError``.
+        The expression combines plain terms, wildcard terms, double-quoted
+        phrases, parentheses and the case-sensitive operators AND, OR, NOT;
+        precedence is NOT, then AND, then OR, with left-to-right associativity
+        at each level. An unquoted fragment containing ``*`` (zero or more
+        characters) or ``?`` (exactly one character) is a wildcard term that
+        hits every document containing at least one expanded term; it needs at
+        least one literal character. Terms hit documents containing the term,
+        phrases hit documents containing the consecutive token sequence (the
+        quoted text keeps ``tokenize`` semantics, wildcards are not special
+        there), AND/OR intersect/union the two sides and NOT complements
+        against every document in the index. Returns the matching document ids
+        sorted ascending; the index is only read, never written. Malformed
+        expressions raise ``ValueError``.
         """
         if not isinstance(expression, str):
             raise ValueError("expression must be a string")
@@ -418,6 +452,10 @@ class InvertedIndex:
             kind = node[0]
             if kind == "TERM":
                 return set(postings.get(node[1], {}))
+            if kind == "WILDCARD":
+                matcher = _compile_pattern(node[1])
+                return {doc_id for term, entries in postings.items() if matcher(term)
+                        for doc_id in entries}
             if kind == "PHRASE":
                 return {doc_id for doc_id, text in documents.items()
                         if _sequence_starts(tokenize(text), node[1])}
@@ -450,6 +488,20 @@ class InvertedIndex:
                    for doc_id, hit in scored.items()]
         results.sort(key=lambda item: (-item["score"], item["id"]))
         return results
+
+    def expand(self, pattern: str) -> list[str]:
+        """List every indexed term matching the wildcard ``pattern``.
+
+        ``*`` matches zero or more characters, ``?`` exactly one; the pattern
+        is lower-cased like any term and may only contain ASCII letters,
+        digits, underscore and the two wildcards. Returns the matching terms
+        sorted by Unicode code point, without duplicates; an empty list when
+        nothing matches. The index is only read, never written. An empty
+        pattern, a non-string pattern or one with unsupported characters
+        raises ``ValueError``.
+        """
+        matcher = _compile_pattern(pattern)
+        return sorted(term for term in self._read()["postings"] if matcher(term))
 
     def terms(self) -> list[str]:
         return sorted(self._read()["postings"])

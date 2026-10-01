@@ -14,7 +14,7 @@
 python3 -m inverted_index --root ./state init
 ```
 
-子命令：`init`、`add <doc_id> <text>`、`get <doc_id>`、`update <doc_id> <text>`、`delete <doc_id>`、`apply <operations>`、`query <term> [term ...]`、`rank <term> [term ...]`、`phrase <text>`、`near <left> <right> <max_gap>`、`search <expression>`、`terms`、`stats`、`reload`、`report`。`apply` 的参数是一个 JSON 数组文本，成功时标准输出一个 JSON 数组。
+子命令：`init`、`add <doc_id> <text>`、`get <doc_id>`、`update <doc_id> <text>`、`delete <doc_id>`、`apply <operations>`、`query <term> [term ...]`、`rank <term> [term ...]`、`phrase <text>`、`near <left> <right> <max_gap>`、`search <expression>`、`expand <pattern>`、`terms`、`stats`、`reload`、`report`。`apply` 的参数是一个 JSON 数组文本，成功时标准输出一个 JSON 数组；`expand` 成功时把匹配词项列表以 JSON 数组写到标准输出。
 
 ## 公开接口
 
@@ -30,7 +30,8 @@ python3 -m inverted_index --root ./state init
 - `rank(terms) -> list[dict]` 按 TF-IDF 求和打分，返回 `{id, matched, score}`，按 `(score 降序, id 升序)` 排序。
 - `phrase(text) -> list[dict]` 精确短语检索：返回 `{id, positions}`，按文档 id 升序；positions 是短语首个词项在文档词项序列中的从 0 开始位置，升序，重复出现保留多个位置。
 - `near(left, right, max_gap) -> list[dict]` 相邻短语近邻检索：两片段按现有 `tokenize` 语义分词，`max_gap` 为非负整数，限定两片段间严格夹着的词项数上限；两片段可任意先后出现，各自连续且不重叠。返回 `{id, occurrences}`，按文档 id 升序；occurrences 为 `[left_start, right_start]` 对（right 先出现时字段仍按左右对应），按 `(left_start, right_start)` 升序，重复位置组合全部保留，未命中文档不出现。任一片段分词后为空，或 `max_gap` 为布尔值、负数、非整数时抛出 `ValueError`。
-- `search(expression) -> list[str]` 组合检索：表达式是单个字符串，由普通词项（连续 ASCII 字母、数字、下划线，按现有规则转小写）、双引号短语（沿用 `phrase` 的连续词序语义，短语内仍用 `tokenize`）、括号和大小写敏感的 `AND`、`OR`、`NOT` 组成；`NOT` 优先于 `AND`，`AND` 优先于 `OR`，同层从左到右结合。词项命中包含该词项的文档，短语命中包含该连续词序的文档，`AND`/`OR` 取两侧集合的交/并，`NOT` 以当前索引全部文档为全集取补。返回按文档 id 升序的字符串列表，无命中返回空列表；查询只读快照，不改写 `index.json`。空表达式、括号不配对、缺少操作数、操作数之间缺少 `AND`/`OR`、`NOT` 后无操作数、连续运算符、未闭合或空的双引号短语、短语分词后为空以及不支持的字符均抛出 `ValueError`。
+- `search(expression) -> list[str]` 组合检索：表达式是单个字符串，由普通词项（连续 ASCII 字母、数字、下划线，按现有规则转小写）、通配词项（未被双引号包裹且含 `*` 或 `?` 的连续片段，`*` 匹配零个或多个字符、`?` 匹配恰好一个字符，必须含至少一个字面字符，命中至少一个展开词项所在的文档）、双引号短语（沿用 `phrase` 的连续词序语义，短语内仍用 `tokenize`，星号问号不作通配符）、括号和大小写敏感的 `AND`、`OR`、`NOT` 组成；`NOT` 优先于 `AND`，`AND` 优先于 `OR`，同层从左到右结合。词项命中包含该词项的文档，短语命中包含该连续词序的文档，`AND`/`OR` 取两侧集合的交/并，`NOT` 以当前索引全部文档为全集取补。返回按文档 id 升序的字符串列表，无命中返回空列表；查询只读快照，不改写 `index.json`。空表达式、括号不配对、缺少操作数、操作数之间缺少 `AND`/`OR`、`NOT` 后无操作数、连续运算符、未闭合或空的双引号短语、短语分词后为空、通配词项没有字面字符以及不支持的字符均抛出 `ValueError`。
+- `expand(pattern) -> list[str]` 通配展开：返回索引中所有匹配 `pattern` 的词项，按 Unicode 码点升序且去重，无匹配返回空列表；`pattern` 按现有词项规则转小写，只允许 ASCII 字母、数字、下划线和通配符 `*`、`?`。空模式、非字符串模式或含非法字符抛出 `ValueError`；只读快照，不改写 `index.json`。
 - `terms() -> list[str]` 升序返回全部词项。
 - `stats() -> dict` 返回文档数、词项数与倒排项数。
 - `reload() -> None` 从落盘的索引快照重新载入。
