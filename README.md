@@ -14,7 +14,7 @@
 python3 -m inverted_index --root ./state init
 ```
 
-子命令：`init`、`add <doc_id> <text>`、`get <doc_id>`、`delete <doc_id>`、`query <term> [term ...]`、`rank <term> [term ...]`、`terms`、`stats`、`reload`、`report`。
+子命令：`init`、`add <doc_id> <text>`、`get <doc_id>`、`delete <doc_id>`、`query <term> [term ...]`、`rank <term> [term ...]`、`phrase <text>`、`terms`、`stats`、`reload`、`report`。
 
 ## 公开接口
 
@@ -26,6 +26,7 @@ python3 -m inverted_index --root ./state init
 - `delete(doc_id) -> bool` 删除文档并清掉它的倒排项。
 - `query(terms) -> list[dict]` 返回同时包含全部词项的文档，按 `(命中词项数, doc_id)` 稳定排序。
 - `rank(terms) -> list[dict]` 按 TF-IDF 求和打分，返回 `{id, matched, score}`，按 `(score 降序, id 升序)` 排序。
+- `phrase(text) -> list[dict]` 精确短语检索：返回 `{id, positions}`，按文档 id 升序；positions 是短语首个词项在文档词项序列中的从 0 开始位置，升序，重复出现保留多个位置。
 - `terms() -> list[str]` 升序返回全部词项。
 - `stats() -> dict` 返回文档数、词项数与倒排项数。
 - `reload() -> None` 从落盘的索引快照重新载入。

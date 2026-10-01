@@ -77,6 +77,26 @@ class InvertedIndex:
         return [{"id": doc_id, "matched": sum(1 for term in wanted if doc_id in postings.get(term, {}))}
                 for doc_id in sorted(hits, key=lambda value: (-sum(1 for t in wanted if value in postings.get(t, {})), value))]
 
+    def phrase(self, text: str) -> list[dict]:
+        """Find documents where the token sequence of ``text`` occurs consecutively.
+
+        Returns ``[{"id": doc_id, "positions": [...]}, ...]`` sorted by document
+        id; each position is the 0-based index of the phrase's first token in the
+        document's token sequence, ascending, with repeats kept.
+        """
+        tokens = tokenize(text)
+        if not tokens:
+            raise ValueError("phrase needs at least one token")
+        documents = self._read()["documents"]
+        results = []
+        for doc_id in sorted(documents):
+            sequence = tokenize(documents[doc_id])
+            positions = [start for start in range(len(sequence) - len(tokens) + 1)
+                         if sequence[start:start + len(tokens)] == tokens]
+            if positions:
+                results.append({"id": doc_id, "positions": positions})
+        return results
+
     def _snapshot(self) -> dict:
         """Read the persisted snapshot and validate its shape and field types."""
         if not self.path.is_file():

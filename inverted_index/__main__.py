@@ -53,6 +53,7 @@ def _parser() -> argparse.ArgumentParser:
     delete = sub.add_parser("delete"); delete.add_argument("doc_id")
     query = sub.add_parser("query"); query.add_argument("terms", nargs="+")
     rank = sub.add_parser("rank", help="score documents against terms"); rank.add_argument("terms", nargs="+")
+    phrase = sub.add_parser("phrase", help="find documents containing an exact token sequence"); phrase.add_argument("text")
     sub.add_parser("terms", help="list every term")
     sub.add_parser("stats", help="print document, term and posting counts")
     sub.add_parser("reload", help="reload the index snapshot")
@@ -80,6 +81,8 @@ def main(argv: list[str] | None = None) -> int:
             except ValueError as error:
                 print(f"error: {error}", file=sys.stderr)
                 return 1
+        elif args.command == "phrase":
+            print(json.dumps(index.phrase(args.text), ensure_ascii=False))
         elif args.command == "terms":
             print(json.dumps(index.terms()))
         elif args.command == "stats":
