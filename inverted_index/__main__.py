@@ -67,7 +67,7 @@ def _parser() -> argparse.ArgumentParser:
     near.add_argument("left")
     near.add_argument("right")
     near.add_argument("max_gap", type=int, help="maximum number of tokens strictly between the fragments")
-    search = sub.add_parser("search", help="evaluate a boolean expression of terms, wildcards, quoted phrases, NEAR(...) conditions, AND, OR, NOT")
+    search = sub.add_parser("search", help="evaluate a boolean expression of terms, wildcards, quoted phrases, NEAR(...) and FUZZY(...) conditions, AND, OR, NOT")
     search.add_argument("expression")
     highlight = sub.add_parser("highlight", help="like search, returning the matched text spans in each document")
     highlight.add_argument("expression")
@@ -79,6 +79,10 @@ def _parser() -> argparse.ArgumentParser:
                           help="maximum number of fragments per document (positive integer)")
     expand = sub.add_parser("expand", help="list every term matching a wildcard pattern")
     expand.add_argument("pattern")
+    fuzzy = sub.add_parser("fuzzy", help="list dictionary terms within an edit distance of a term")
+    fuzzy.add_argument("term")
+    fuzzy.add_argument("--max-distance", dest="max_distance", type=int, default=1,
+                       help="maximum Levenshtein edit distance (an integer within 0..2, default 1)")
     sub.add_parser("terms", help="list every term")
     sub.add_parser("stats", help="print document, term and posting counts")
     sub.add_parser("reload", help="reload the index snapshot")
@@ -122,6 +126,8 @@ def main(argv: list[str] | None = None) -> int:
                              ensure_ascii=False))
         elif args.command == "expand":
             print(json.dumps(index.expand(args.pattern), ensure_ascii=False))
+        elif args.command == "fuzzy":
+            print(json.dumps(index.fuzzy(args.term, args.max_distance), ensure_ascii=False))
         elif args.command == "terms":
             print(json.dumps(index.terms()))
         elif args.command == "stats":

@@ -49,6 +49,42 @@ def _compile_pattern(pattern: str):
     return re.compile(regex + r"\Z").match
 
 
+_FUZZY_TERM_CHARS = re.compile(r"[0-9A-Za-z_]+\Z")
+
+
+def _validate_fuzzy_term(term: object) -> str:
+    """Validate a fuzzy-comparison term and return it lower-cased.
+
+    Only non-empty strings of ASCII letters, digits and underscore are
+    accepted -- the term is never tokenised, stripped of whitespace or
+    interpreted for wildcards.
+    """
+    if not isinstance(term, str):
+        raise ValueError("term must be a string")
+    if not term:
+        raise ValueError("term must not be empty")
+    if not _FUZZY_TERM_CHARS.match(term):
+        raise ValueError(f"term contains unsupported characters: {term!r}")
+    return term.lower()
+
+
+def _levenshtein(left: str, right: str) -> int:
+    """Levenshtein edit distance: single-character inserts, deletes, replacements.
+
+    Swapping two adjacent characters is not a single operation.
+    """
+    if len(left) < len(right):
+        left, right = right, left
+    previous = list(range(len(right) + 1))
+    for row, left_char in enumerate(left, 1):
+        current = [row]
+        for column, right_char in enumerate(right, 1):
+            current.append(min(previous[column] + 1, current[column - 1] + 1,
+                               previous[column - 1] + (left_char != right_char)))
+        previous = current
+    return previous[-1]
+
+
 def _require_non_empty_string(value: object, name: str) -> None:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{name} must be a non-empty string")
@@ -70,8 +106,10 @@ def _sequence_starts(sequence: list[str], fragment: list[str]) -> list[int]:
 
 _SEARCH_OPERATORS = ("AND", "OR", "NOT")
 _NEAR_NAME = "NEAR"
+_FUZZY_NAME = "FUZZY"
 _ASCII_DIGITS = frozenset("0123456789")
 _NEAR_MAX_GAP = 2147483647
+_FUZZY_MAX_DISTANCE = 2
 
 
 def _skip_spaces(expression: str, position: int) -> int:
@@ -126,14 +164,48 @@ def _lex_near_call(expression: str, position: int) -> tuple[tuple[str, object], 
     return ("NEAR", (left_tokens, right_tokens, distance)), position + 1
 
 
+def _lex_fuzzy_call(expression: str, position: int) -> tuple[tuple[str, object], int]:
+    """Lex a ``FUZZY("term", distance)`` call; ``position`` is at ``(``.
+
+    Exactly two arguments: a double-quoted term following
+    :func:`_validate_fuzzy_term` rules (quotes cannot be embedded or escaped)
+    and an ASCII decimal distance from 0 to 2, leading zeros allowed.
+    """
+    position = _skip_spaces(expression, position + 1)
+    if position >= len(expression) or expression[position] != '"':
+        raise ValueError("FUZZY term must be double-quoted")
+    end = expression.find('"', position + 1)
+    if end == -1:
+        raise ValueError("unclosed double quote in search expression")
+    term = _validate_fuzzy_term(expression[position + 1:end])
+    position = _skip_spaces(expression, end + 1)
+    if position >= len(expression) or expression[position] != ",":
+        raise ValueError("FUZZY needs exactly two arguments")
+    position = _skip_spaces(expression, position + 1)
+    digits_start = position
+    while position < len(expression) and expression[position] in _ASCII_DIGITS:
+        position += 1
+    if position == digits_start:
+        raise ValueError("FUZZY distance must be an ASCII decimal integer")
+    distance = int(expression[digits_start:position])
+    if distance > _FUZZY_MAX_DISTANCE:
+        raise ValueError("FUZZY distance must be within 0..2")
+    position = _skip_spaces(expression, position)
+    if position >= len(expression) or expression[position] != ")":
+        raise ValueError("FUZZY needs exactly two arguments")
+    return ("FUZZY", (term, distance)), position + 1
+
+
 def _lex_search(expression: str) -> list[tuple[str, object]]:
     """Split a search expression into ``(kind, value)`` tokens.
 
     Kinds are ``TERM`` (value the lower-cased term), ``WILDCARD`` (value the
     lower-cased pattern), ``PHRASE`` (value the tokenised phrase), ``NEAR``
-    (value ``(left_tokens, right_tokens, max_gap)``), ``LPAREN``, ``RPAREN``
+    (value ``(left_tokens, right_tokens, max_gap)``), ``FUZZY`` (value
+    ``(term, max_distance)``), ``LPAREN``, ``RPAREN``
     and the operators themselves. Operators are case-sensitive; a bare
-    ``NEAR`` not directly followed by ``(`` is an ordinary term. Anything
+    ``NEAR`` or ``FUZZY`` not directly followed by ``(`` is an ordinary term.
+    Anything
     outside terms, wildcards, quotes, parentheses and whitespace is rejected.
     A wildcard fragment needs at least one literal character.
     """
@@ -167,6 +239,12 @@ def _lex_search(expression: str) -> list[tuple[str, object]]:
                 probe = _skip_spaces(expression, match.end())
                 if probe < len(expression) and expression[probe] == "(":
                     token, position = _lex_near_call(expression, probe)
+                    tokens.append(token)
+                    continue
+            if word == _FUZZY_NAME:
+                probe = _skip_spaces(expression, match.end())
+                if probe < len(expression) and expression[probe] == "(":
+                    token, position = _lex_fuzzy_call(expression, probe)
                     tokens.append(token)
                     continue
             if word in _SEARCH_OPERATORS:
@@ -229,6 +307,8 @@ def _parse_search_primary(tokens, position):
         return ("PHRASE", value), position + 1
     if kind == "NEAR":
         return ("NEAR", value), position + 1
+    if kind == "FUZZY":
+        return ("FUZZY", value), position + 1
     if kind == "LPAREN":
         node, position = _parse_search_or(tokens, position + 1)
         if position >= len(tokens) or tokens[position][0] != "RPAREN":
@@ -276,6 +356,11 @@ def _evaluate_search(tree, documents: dict[str, str], postings: dict[str, dict])
             left, right, max_gap = node[1]
             return {doc_id for doc_id, text in documents.items()
                     if _near_match(tokenize(text), left, right, max_gap)}
+        if kind == "FUZZY":
+            term, max_distance = node[1]
+            return {doc_id for candidate, entries in postings.items()
+                    if _levenshtein(term, candidate) <= max_distance
+                    for doc_id in entries}
         if kind == "AND":
             return evaluate(node[1]) & evaluate(node[2])
         if kind == "OR":
@@ -305,14 +390,17 @@ def _merge_spans(spans: list[tuple[int, int]]) -> list[list[int]]:
 
 
 def _evaluate_highlight(tree, words: list[str], bounds: list[tuple[int, int]],
-                        matchers: dict[str, object]) -> tuple[bool, list[tuple[int, int]]]:
+                        matchers: dict) -> tuple[bool, list[tuple[int, int]]]:
     """Evaluate a parsed tree for one document, returning ``(matched, spans)``.
 
     ``words`` are the document's lower-cased tokens and ``bounds`` their
     half-open Unicode code point offsets. Matching is identical to
     :func:`_evaluate_search` (terms come from the same tokenisation), but a
     matched node also yields the spans that actually participate: every term
-    or expanded-wildcard occurrence, each phrase match from the first token's
+    or expanded-wildcard occurrence, every occurrence of every term a FUZZY
+    condition expands to (document tokens are exactly the dictionary terms,
+    so a distance predicate over the tokens expands the same set), each
+    phrase match from the first token's
     start to the last token's end, and both fragments of every NEAR pair that
     satisfies the gap and non-overlap rules. NOT only filters -- it never
     yields spans, so a double negation matches without restoring highlights.
@@ -333,6 +421,16 @@ def _evaluate_highlight(tree, words: list[str], bounds: list[tuple[int, int]],
             if matcher is None:
                 matcher = _compile_pattern(pattern)
                 matchers[pattern] = matcher
+            spans = [bounds[index] for index, token in enumerate(words) if matcher(token)]
+            return bool(spans), spans
+        if kind == "FUZZY":
+            term, max_distance = node[1]
+            key = ("FUZZY", term, max_distance)
+            matcher = matchers.get(key)
+            if matcher is None:
+                def matcher(token: str, _term=term, _max=max_distance) -> bool:
+                    return _levenshtein(_term, token) <= _max
+                matchers[key] = matcher
             spans = [bounds[index] for index, token in enumerate(words) if matcher(token)]
             return bool(spans), spans
         if kind == "PHRASE":
@@ -645,6 +743,12 @@ class InvertedIndex:
         with at most ``distance`` tokens strictly between them (an ASCII
         decimal integer from 0 to 2147483647, leading zeros allowed); a bare
         ``NEAR`` without a following parenthesis is still an ordinary term.
+        A ``FUZZY("term", distance)`` condition hits documents containing at
+        least one dictionary term within Levenshtein edit distance
+        ``distance`` of the quoted term (the term follows the same rules as
+        :meth:`fuzzy`; ``distance`` is an ASCII decimal integer from 0 to 2,
+        leading zeros allowed); a bare ``FUZZY`` without a following
+        parenthesis is still an ordinary term.
         AND/OR intersect/union the two sides and NOT complements against every
         document in the index. Returns the matching document ids sorted
         ascending; the index is only read, never written. Malformed
@@ -665,7 +769,9 @@ class InvertedIndex:
         full stored text and half-open ``[start, end)`` offsets counted in
         Unicode code points from zero. A plain term highlights every
         occurrence of the complete term, a wildcard every occurrence of every
-        expanded term, a phrase the whole interval of each consecutive match
+        expanded term, a FUZZY condition every occurrence of every dictionary
+        term within its edit distance, a phrase the whole interval of each
+        consecutive match
         (from the first token's start through the last token's end, keeping the
         punctuation and whitespace in between), and a NEAR condition both
         fragments of every fragment pair satisfying the existing gap and
@@ -687,7 +793,7 @@ class InvertedIndex:
         postings = snapshot["postings"]
         matching = _evaluate_search(tree, documents, postings)
         results: list[dict] = []
-        matchers: dict[str, object] = {}
+        matchers: dict = {}
         for doc_id in sorted(matching):
             text = documents[doc_id]
             matches = list(TOKEN.finditer(text))
@@ -735,7 +841,7 @@ class InvertedIndex:
         postings = snapshot["postings"]
         matching = _evaluate_search(tree, documents, postings)
         results: list[dict] = []
-        matchers: dict[str, object] = {}
+        matchers: dict = {}
         for doc_id in sorted(matching):
             text = documents[doc_id]
             matches = list(TOKEN.finditer(text))
@@ -860,6 +966,32 @@ class InvertedIndex:
         """
         matcher = _compile_pattern(pattern)
         return sorted(term for term in self._read()["postings"] if matcher(term))
+
+    def fuzzy(self, term: str, max_distance: int = 1) -> list[dict]:
+        """List dictionary terms within Levenshtein edit distance of ``term``.
+
+        The term is only lower-cased -- never tokenised, stripped of
+        whitespace or interpreted for wildcards -- and may only contain
+        ASCII letters, digits and underscore. ``max_distance`` is an integer
+        from 0 to 2 (booleans rejected); distance counts single-character
+        insertions, deletions and replacements (swapping two adjacent
+        characters is not one operation). Returns
+        ``[{"term": term, "distance": distance}, ...]`` covering every
+        dictionary term within the distance, exact matches included, without
+        duplicates, sorted by distance then by term Unicode code points; an
+        empty list when nothing matches. The index is only read, never
+        written. Bad arguments raise ``ValueError`` before the store is
+        touched, even on an empty index.
+        """
+        if isinstance(max_distance, bool) or not isinstance(max_distance, int) \
+                or not 0 <= max_distance <= _FUZZY_MAX_DISTANCE:
+            raise ValueError("max_distance must be an integer within 0..2")
+        lowered = _validate_fuzzy_term(term)
+        postings = self._read()["postings"]
+        hits = [(candidate, distance) for candidate in postings
+                if (distance := _levenshtein(lowered, candidate)) <= max_distance]
+        hits.sort(key=lambda item: (item[1], item[0]))
+        return [{"term": candidate, "distance": distance} for candidate, distance in hits]
 
     def terms(self) -> list[str]:
         return sorted(self._read()["postings"])
