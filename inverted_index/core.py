@@ -156,13 +156,61 @@ def _sloppy_occurrences(sequence: list[str], tokens: list[str], slop: int) -> li
     return [list(occurrence) for occurrence in sorted({tuple(hit) for hit in occurrences})]
 
 
+def _minimal_windows(sequence: list[str], tokens: list[str]) -> list[tuple[int, int]]:
+    """All minimal covering windows of ``tokens`` in ``sequence``.
+
+    A window is a consecutive half-open interval ``[start, end)`` of token
+    positions whose positions cover every query token with its multiplicity
+    (repeated query tokens occupy distinct positions; no position is reused).
+    It is kept only when it is inclusion-minimal -- no strict sub-interval
+    still covers the query, equivalently the positions at both endpoints are
+    indispensable. Results are deduplicated and sorted by ``(start, end)``;
+    overlapping windows are all kept. A single-token query yields a one-token
+    window per occurrence.
+    """
+    wanted = Counter(tokens)
+    windows: set[tuple[int, int]] = set()
+    missing = len(wanted)
+    counts: dict[str, int] = {}
+    left = 0
+    for right, token in enumerate(sequence):
+        need = wanted.get(token)
+        if need is not None:
+            seen = counts.get(token, 0) + 1
+            counts[token] = seen
+            if seen == need:
+                missing -= 1
+        if missing:
+            continue
+        # Coverage was reached exactly at ``right`` (its token is indispensable);
+        # shrink to the shortest covering suffix ending at ``right``.
+        while left <= right:
+            first_token = sequence[left]
+            first_need = wanted.get(first_token)
+            if first_need is not None and counts[first_token] <= first_need:
+                break
+            if first_need is not None:
+                counts[first_token] -= 1
+            left += 1
+        windows.add((left, right + 1))
+        # Advance past the indispensable left endpoint so the same coverage
+        # cannot be re-recorded stretched over later irrelevant tokens.
+        counts[sequence[left]] -= 1
+        missing += 1
+        left += 1
+    return sorted(windows)
+
+
+
 _SEARCH_OPERATORS = ("AND", "OR", "NOT")
 _NEAR_NAME = "NEAR"
 _FUZZY_NAME = "FUZZY"
 _SLOP_NAME = "SLOP"
+_WINDOW_NAME = "WINDOW"
 _ASCII_DIGITS = frozenset("0123456789")
 _NEAR_MAX_GAP = 2147483647
 _SLOP_MAX = 2147483647
+_WINDOW_MAX_GAP = 2147483647
 _FUZZY_MAX_DISTANCE = 2
 _FUZZY_TERM_CHARS = re.compile(r"[0-9A-Za-z_]+\Z")
 
@@ -336,6 +384,43 @@ def _lex_slop_call(expression: str, position: int) -> tuple[tuple[str, object], 
     return ("SLOP", (tokens, slop)), position + 1
 
 
+def _lex_window_call(expression: str, position: int) -> tuple[tuple[str, object], int]:
+    """Lex a ``WINDOW("text", gap)`` call; ``position`` is at ``(``.
+
+    The text must be double-quoted and tokenise to at least one token with
+    the usual :func:`tokenize` rules (wildcards not special, double quotes
+    cannot be embedded or escaped); the gap is an ASCII decimal integer from
+    0 to 2147483647, leading zeros allowed. Exactly two arguments.
+    """
+    position = _skip_spaces(expression, position + 1)
+    if position >= len(expression) or expression[position] != '"':
+        raise ValueError("WINDOW text must be double-quoted")
+    end = expression.find('"', position + 1)
+    if end == -1:
+        raise ValueError("unclosed double quote in search expression")
+    tokens = tokenize(expression[position + 1:end])
+    if not tokens:
+        raise ValueError("WINDOW text needs at least one token")
+    position = _skip_spaces(expression, end + 1)
+    if position >= len(expression) or expression[position] != ",":
+        raise ValueError("WINDOW needs exactly two arguments")
+    position = _skip_spaces(expression, position + 1)
+    digits_start = position
+    while position < len(expression) and expression[position] in _ASCII_DIGITS:
+        position += 1
+    if position == digits_start:
+        raise ValueError("WINDOW gap must be an ASCII decimal integer")
+    gap = int(expression[digits_start:position])
+    if gap > _WINDOW_MAX_GAP:
+        raise ValueError("WINDOW gap must be within 0..2147483647")
+    position = _skip_spaces(expression, position)
+    if position < len(expression) and expression[position] == ",":
+        raise ValueError("WINDOW needs exactly two arguments")
+    if position >= len(expression) or expression[position] != ")":
+        raise ValueError("unbalanced parentheses in search expression")
+    return ("WINDOW", (tokens, gap)), position + 1
+
+
 def _lex_search(expression: str) -> list[tuple[str, object]]:
     """Split a search expression into ``(kind, value)`` tokens.
 
@@ -343,10 +428,10 @@ def _lex_search(expression: str) -> list[tuple[str, object]]:
     lower-cased pattern), ``PHRASE`` (value the tokenised phrase), ``NEAR``
     (value ``(left_tokens, right_tokens, max_gap)``), ``FUZZY`` (value
     ``(term, max_distance)``), ``SLOP`` (value ``(tokens, slop)``),
-    ``LPAREN``, ``RPAREN``
+    ``WINDOW`` (value ``(tokens, max_gap)``), ``LPAREN``, ``RPAREN``
     and the operators themselves. Operators are case-sensitive; a bare
-    ``NEAR``, ``FUZZY`` or ``SLOP`` not directly followed by ``(`` is an
-    ordinary term.
+    ``NEAR``, ``FUZZY``, ``SLOP`` or ``WINDOW`` not directly followed by
+    ``(`` is an ordinary term.
     Anything outside terms, wildcards, quotes, parentheses and whitespace is
     rejected. A wildcard fragment needs at least one literal character.
     """
@@ -392,6 +477,12 @@ def _lex_search(expression: str) -> list[tuple[str, object]]:
                 probe = _skip_spaces(expression, match.end())
                 if probe < len(expression) and expression[probe] == "(":
                     token, position = _lex_slop_call(expression, probe)
+                    tokens.append(token)
+                    continue
+            if word == _WINDOW_NAME:
+                probe = _skip_spaces(expression, match.end())
+                if probe < len(expression) and expression[probe] == "(":
+                    token, position = _lex_window_call(expression, probe)
                     tokens.append(token)
                     continue
             if word in _SEARCH_OPERATORS:
@@ -458,6 +549,8 @@ def _parse_search_primary(tokens, position):
         return ("FUZZY", value), position + 1
     if kind == "SLOP":
         return ("SLOP", value), position + 1
+    if kind == "WINDOW":
+        return ("WINDOW", value), position + 1
     if kind == "LPAREN":
         node, position = _parse_search_or(tokens, position + 1)
         if position >= len(tokens) or tokens[position][0] != "RPAREN":
@@ -466,6 +559,18 @@ def _parse_search_primary(tokens, position):
     if kind == "RPAREN":
         raise ValueError("unbalanced parentheses in search expression")
     raise ValueError(f"missing operand in search expression before {kind}")
+
+
+def _gap_windows(sequence: list[str], tokens: list[str], max_gap: int) -> list[tuple[int, int]]:
+    """Minimal covering windows satisfying the ``max_gap`` extra-token budget.
+
+    Keeps the output of :func:`_minimal_windows` whose token count minus the
+    query token count (the number of unmatched, sandwiched tokens) is at most
+    ``max_gap``.
+    """
+    budget = max_gap + len(tokens)
+    return [(start, end) for start, end in _minimal_windows(sequence, tokens)
+            if end - start <= budget]
 
 
 def _near_match(sequence: list[str], left: list[str], right: list[str], max_gap: int) -> bool:
@@ -514,6 +619,10 @@ def _evaluate_search(tree, documents: dict[str, str], postings: dict[str, dict])
             tokens, slop = node[1]
             return {doc_id for doc_id, text in documents.items()
                     if _sloppy_occurrences(tokenize(text), tokens, slop)}
+        if kind == "WINDOW":
+            tokens, max_gap = node[1]
+            return {doc_id for doc_id, text in documents.items()
+                    if _gap_windows(tokenize(text), tokens, max_gap)}
         if kind == "AND":
             return evaluate(node[1]) & evaluate(node[2])
         if kind == "OR":
@@ -553,9 +662,11 @@ def _evaluate_highlight(tree, words: list[str], bounds: list[tuple[int, int]],
     or expanded-wildcard occurrence, each phrase match from the first token's
     start to the last token's end, both fragments of every NEAR pair that
     satisfies the gap and non-overlap rules, every occurrence of every
-    term within a FUZZY condition's edit distance, and each SLOP match as one
+    term within a FUZZY condition's edit distance, each SLOP match as one
     interval from its first matched token's start to its last matched token's
-    end (keeping the sandwiched tokens, punctuation and whitespace). NOT only
+    end (keeping the sandwiched tokens, punctuation and whitespace), and each
+    retained WINDOW from its first token's start through its last token's end,
+    likewise keeping the sandwiched tokens, punctuation and whitespace. NOT only
     filters -- it never
     yields spans, so a double negation matches without restoring highlights.
     """
@@ -608,6 +719,11 @@ def _evaluate_highlight(tree, words: list[str], bounds: list[tuple[int, int]],
             tokens, slop = node[1]
             spans = sorted({char_span(occurrence[0], occurrence[-1] + 1)
                             for occurrence in _sloppy_occurrences(words, tokens, slop)})
+            return bool(spans), spans
+        if kind == "WINDOW":
+            tokens, max_gap = node[1]
+            spans = sorted({char_span(start, end)
+                            for start, end in _gap_windows(words, tokens, max_gap)})
             return bool(spans), spans
         if kind == "AND":
             left_match, left_spans = evaluate(node[1])
@@ -876,6 +992,42 @@ class InvertedIndex:
                 results.append({"id": doc_id, "occurrences": occurrences})
         return results
 
+    def window(self, text: str, max_gap: int = 0) -> list[dict]:
+        """Find documents containing unordered minimal covering windows of ``text``.
+
+        The query text is tokenised with the usual :func:`tokenize` rules
+        (wildcards are not special). A window is a consecutive interval of
+        the document's token sequence that covers every query token with its
+        multiplicity -- repeated query tokens occupy distinct positions and
+        no position is reused; query order is irrelevant. A window is kept
+        only when no strict sub-interval still covers the query (both
+        endpoint positions are indispensable). It hits when the window's
+        token count minus the query token count -- the number of sandwiched
+        tokens -- is at most ``max_gap``, an integer from 0 to 2147483647
+        (booleans rejected). A single-token query returns a one-token window
+        per occurrence. Returns ``[{"id": doc_id, "windows": [[start, end],
+        ...]}, ...]`` sorted by document id (Unicode code points); each
+        window is a half-open ``[start, end)`` 0-based token-position pair,
+        deduplicated and sorted by ``(start, end)``, with overlapping
+        windows kept. All arguments are validated before the snapshot is
+        read; an empty index or no hits yields an empty array. The index is
+        only read, never written.
+        """
+        tokens = tokenize(text)
+        if not tokens:
+            raise ValueError("window query needs at least one token")
+        if isinstance(max_gap, bool) or not isinstance(max_gap, int) \
+                or not 0 <= max_gap <= _WINDOW_MAX_GAP:
+            raise ValueError("max_gap must be an integer within 0..2147483647")
+        documents = self._read()["documents"]
+        results = []
+        for doc_id in sorted(documents):
+            sequence = tokenize(documents[doc_id])
+            windows = [list(window) for window in _gap_windows(sequence, tokens, max_gap)]
+            if windows:
+                results.append({"id": doc_id, "windows": windows})
+        return results
+
     def near(self, left: str, right: str, max_gap: int) -> list[dict]:
         """Find documents where the token sequences of ``left`` and ``right`` are close.
 
@@ -950,6 +1102,17 @@ class InvertedIndex:
         the function name only accepts upper-case ``SLOP``, whitespace is
         allowed between the name and the parenthesis and around the
         arguments, and a bare ``SLOP`` without a following parenthesis is
+        still an ordinary term. A
+        ``WINDOW("text", gap)`` condition hits documents containing an
+        unordered minimal covering window of the tokenised double-quoted
+        text, exactly as in :meth:`window`: a consecutive interval covering
+        every query token with its multiplicity at distinct positions (query
+        order irrelevant) that no strict sub-interval still covers, whose
+        number of extra sandwiched tokens is at most ``gap``; the gap is an
+        ASCII decimal integer from 0 to 2147483647, leading zeros allowed;
+        the function name only accepts upper-case ``WINDOW``, whitespace is
+        allowed between the name and the parenthesis and around the
+        arguments, and a bare ``WINDOW`` without a following parenthesis is
         still an ordinary term.
         AND/OR intersect/union the two sides and NOT complements against every
         document in the index. Returns the matching document ids sorted
@@ -979,7 +1142,10 @@ class InvertedIndex:
         condition every occurrence of every expanded term within the edit
         distance, and a SLOP condition each ordered match as one interval
         from its first matched token's start through its last matched token's
-        end, keeping the sandwiched tokens, punctuation and whitespace. AND collects both
+        end, keeping the sandwiched tokens, punctuation and whitespace, and a
+        WINDOW condition every retained window as one interval from its first
+        token's start through its last token's end, keeping the sandwiched
+        tokens, punctuation and whitespace. AND collects both
         sides, OR only the branches that hold in the document, NOT only
         filters (its interior yields no spans and double negation does not
         restore them), so a document matched solely through a negation still

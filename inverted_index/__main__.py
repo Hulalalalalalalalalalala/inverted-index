@@ -67,6 +67,10 @@ def _parser() -> argparse.ArgumentParser:
     sloppy.add_argument("text")
     sloppy.add_argument("--slop", type=int, default=0,
                         help="maximum total tokens sandwiched between matched positions (integer 0..2147483647, default 0)")
+    window = sub.add_parser("window", help="find unordered minimal covering windows of a token multiset")
+    window.add_argument("text")
+    window.add_argument("--max-gap", dest="max_gap", type=int, default=0,
+                        help="maximum extra tokens inside a covering window (integer 0..2147483647, default 0)")
     near = sub.add_parser("near", help="find documents where two token fragments occur close together")
     near.add_argument("left")
     near.add_argument("right")
@@ -121,6 +125,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(index.phrase(args.text), ensure_ascii=False))
         elif args.command == "sloppy-phrase":
             print(json.dumps(index.sloppy_phrase(args.text, args.slop), ensure_ascii=False))
+        elif args.command == "window":
+            print(json.dumps(index.window(args.text, args.max_gap), ensure_ascii=False))
         elif args.command == "near":
             print(json.dumps(index.near(args.left, args.right, args.max_gap), ensure_ascii=False))
         elif args.command == "search":
