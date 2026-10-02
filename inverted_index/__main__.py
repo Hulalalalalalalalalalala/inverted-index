@@ -14,6 +14,24 @@ from .core import InvertedIndex, SnapshotError
 
 USAGE_ERROR = 2
 
+
+def _float_arg(value: str) -> float:
+    """Parse a CLI number with ordinary :func:`float` semantics.
+
+    ``inf``/``nan`` spellings parse as usual (the bm25 validation then
+    rejects them as non-finite with a usage error); a literal outside the
+    float range (``1e999`` on Python versions where that raises instead of
+    becoming ``inf``) is reported as an argparse usage error rather than
+    escaping as an ``OverflowError`` traceback.
+    """
+    try:
+        return float(value)
+    except OverflowError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
+_float_arg.__name__ = "float"
+
 def _tags() -> list[str]:
     """Tags this domain claims: the comma-separated line that follows each named category heading."""
     import pathlib
@@ -60,8 +78,8 @@ def _parser() -> argparse.ArgumentParser:
     bm25.add_argument("terms", nargs="+")
     bm25.add_argument("--filter", dest="expression", default=None,
                       help="optional boolean filter expression (same syntax as search)")
-    bm25.add_argument("--k1", type=float, default=1.2, help="BM25 k1 (finite positive number)")
-    bm25.add_argument("--b", type=float, default=0.75, help="BM25 b (a number within [0, 1])")
+    bm25.add_argument("--k1", type=_float_arg, default=1.2, help="BM25 k1 (finite positive number)")
+    bm25.add_argument("--b", type=_float_arg, default=0.75, help="BM25 b (a number within [0, 1])")
     phrase = sub.add_parser("phrase", help="find documents containing an exact token sequence"); phrase.add_argument("text")
     near = sub.add_parser("near", help="find documents where two token fragments occur close together")
     near.add_argument("left")

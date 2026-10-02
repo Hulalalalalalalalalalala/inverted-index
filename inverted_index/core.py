@@ -481,6 +481,35 @@ def _evaluate_highlight(tree, words: list[str], bounds: list[tuple[int, int]],
     return evaluate(tree)
 
 
+def _require_bm25_k1(value: object) -> float | int:
+    """Validate BM25 ``k1``: int or float, finite, strictly positive.
+
+    Booleans are rejected; arbitrarily large positive integers (even ones too
+    big to convert to float, e.g. ``10**1000``) stay legal, so the check must
+    not route big integers through :func:`math.isfinite` (which raises
+    ``OverflowError``).
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise ValueError("k1 must be a finite positive number")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("k1 must be a finite positive number")
+    return value
+
+
+def _require_bm25_b(value: object) -> float | int:
+    """Validate BM25 ``b``: int or float, finite, within the closed interval [0, 1].
+
+    Booleans are rejected. A huge out-of-range integer is rejected by the
+    interval comparison alone -- :func:`math.isfinite` is only applied to
+    floats, so an oversized integer can never surface as ``OverflowError``.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
+        raise ValueError("b must be a finite number within [0, 1]")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("b must be a finite number within [0, 1]")
+    return value
+
+
 class InvertedIndex:
     """A single-process inverted index rooted at ``root``."""
 
@@ -917,15 +946,19 @@ class InvertedIndex:
         number of distinct matched terms, sorted by rounded score descending
         then id ascending. Read-only; raises ``ValueError`` for bad terms,
         ``k1``/``b`` or an invalid expression, even when nothing could match.
+        ``k1`` accepts arbitrarily large positive integers (including ones
+        beyond the float range such as ``10**1000``) and the tiniest positive
+        finite floats; the score is computed in an overflow-safe equivalent
+        form so every returned value stays finite, and non-finite floats,
+        non-positive ``k1`` or out-of-range ``b`` never leak
+        ``OverflowError``/``ZeroDivisionError``.
         """
         if not isinstance(terms, list) or not terms:
             raise ValueError("bm25 needs a non-empty list of terms")
         if any(not isinstance(term, str) or not term for term in terms):
             raise ValueError("bm25 terms must be non-empty strings")
-        if isinstance(k1, bool) or not isinstance(k1, (int, float)) or not math.isfinite(k1) or k1 <= 0:
-            raise ValueError("k1 must be a finite positive number")
-        if isinstance(b, bool) or not isinstance(b, (int, float)) or not math.isfinite(b) or not 0 <= b <= 1:
-            raise ValueError("b must be a finite number within [0, 1]")
+        k1 = _require_bm25_k1(k1)
+        b = _require_bm25_b(b)
         tree = None
         if expression is not None:
             if not isinstance(expression, str):
@@ -944,6 +977,12 @@ class InvertedIndex:
         if n_docs == 0 or total_length == 0:
             return []
         avgdl = total_length / n_docs
+        # ``scale`` replaces the k1 + 1 factors with an overflow-safe form:
+        # k1/(k1 + 1) lies in (0, 1] for every finite positive k1 and converges
+        # to 1.0 even when k1 is an integer beyond the float range (10**1000),
+        # where k1 + 1 itself could never be converted to float. Algebraically
+        # tf*(k1+1)/(tf + k1*B) == tf/(scale*B + tf*(1-scale)).
+        scale = k1 / (k1 + 1)
         scored: dict[str, dict] = {}
         for term in wanted:
             entries = postings.get(term, {})
@@ -952,9 +991,8 @@ class InvertedIndex:
             for doc_id, tf in entries.items():
                 if candidates is not None and doc_id not in candidates:
                     continue
-                dl = lengths[doc_id]
-                denominator = tf + k1 * (1 - b + b * dl / avgdl)
-                contribution = idf * tf * (k1 + 1) / denominator
+                length_norm = 1 - b + b * lengths[doc_id] / avgdl
+                contribution = idf * tf / (scale * length_norm + tf * (1.0 - scale))
                 hit = scored.setdefault(doc_id, {"matched": 0, "score": 0.0})
                 hit["matched"] += 1
                 hit["score"] += contribution
