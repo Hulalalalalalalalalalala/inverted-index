@@ -71,6 +71,12 @@ def _parser() -> argparse.ArgumentParser:
     search.add_argument("expression")
     highlight = sub.add_parser("highlight", help="like search, returning the matched text spans in each document")
     highlight.add_argument("expression")
+    snippets = sub.add_parser("snippets", help="like highlight, returning merged context fragments around each match")
+    snippets.add_argument("expression")
+    snippets.add_argument("--context", type=int, default=20,
+                          help="code points of context kept around each highlight (non-negative integer)")
+    snippets.add_argument("--max-fragments", type=int, default=3, dest="max_fragments",
+                          help="maximum number of fragments per document (positive integer)")
     expand = sub.add_parser("expand", help="list every term matching a wildcard pattern")
     expand.add_argument("pattern")
     sub.add_parser("terms", help="list every term")
@@ -111,6 +117,9 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(index.search(args.expression), ensure_ascii=False))
         elif args.command == "highlight":
             print(json.dumps(index.highlight(args.expression), ensure_ascii=False))
+        elif args.command == "snippets":
+            print(json.dumps(index.snippets(args.expression, args.context, args.max_fragments),
+                             ensure_ascii=False))
         elif args.command == "expand":
             print(json.dumps(index.expand(args.pattern), ensure_ascii=False))
         elif args.command == "terms":
