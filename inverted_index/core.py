@@ -697,6 +697,69 @@ class InvertedIndex:
             results.append({"id": doc_id, "text": text, "spans": _merge_spans(spans)})
         return results
 
+    def snippets(self, expression: str, context: int = 20, max_fragments: int = 3) -> list[dict]:
+        """Return matching documents with context fragments around the matched spans.
+
+        Uses the same syntax and filtering semantics as :meth:`search` and the
+        same highlight spans as :meth:`highlight`, so the matching document set
+        and the highlighted intervals are identical; items are sorted by
+        document id and each is ``{"id": doc_id, "fragments": [...]}``. Every
+        highlight span is widened by up to ``context`` Unicode code points on
+        each side, clipped to the text bounds; widened windows that overlap or
+        abut merge (transitively), and the first ``max_fragments`` windows by
+        start are kept. Each fragment is ``{"start", "end", "text", "spans"}``:
+        ``start``/``end`` the window's half-open offsets in the stored text,
+        ``text`` the corresponding slice (original case, punctuation and
+        whitespace kept, nothing inserted), and ``spans`` every highlight span
+        intersecting the window, clipped to it, shifted to window-relative
+        half-open offsets and deduplicated/merged as in :meth:`highlight`. A
+        document matched without any highlight span (only through negation)
+        yields a single fragment covering the first ``2 * context + 1`` code
+        points with empty ``spans``; an empty stored text yields no fragments.
+        A valid expression with no hits returns an empty array; the whole call
+        reads one snapshot and never writes. ``context`` must be a
+        non-negative integer and ``max_fragments`` a positive integer (booleans
+        rejected); bad parameters, a non-string or blank expression or
+        malformed syntax raise ``ValueError`` before the store is touched, even
+        on an empty index.
+        """
+        if not isinstance(expression, str) or not expression.strip():
+            raise ValueError("expression must be a non-blank string")
+        if isinstance(context, bool) or not isinstance(context, int) or context < 0:
+            raise ValueError("context must be a non-negative integer")
+        if isinstance(max_fragments, bool) or not isinstance(max_fragments, int) or max_fragments < 1:
+            raise ValueError("max_fragments must be a positive integer")
+        tree = _parse_search(_lex_search(expression))
+        snapshot = self._read()
+        documents = snapshot["documents"]
+        postings = snapshot["postings"]
+        matching = _evaluate_search(tree, documents, postings)
+        results: list[dict] = []
+        matchers: dict[str, object] = {}
+        for doc_id in sorted(matching):
+            text = documents[doc_id]
+            matches = list(TOKEN.finditer(text))
+            words = [match.group(0).lower() for match in matches]
+            bounds = [(match.start(), match.end()) for match in matches]
+            _, spans = _evaluate_highlight(tree, words, bounds, matchers)
+            merged = _merge_spans(spans)
+            fragments: list[dict] = []
+            if merged:
+                windows = _merge_spans([(max(0, start - context), min(len(text), end + context))
+                                        for start, end in merged])
+                for window_start, window_end in windows[:max_fragments]:
+                    local = _merge_spans([(max(start, window_start) - window_start,
+                                           min(end, window_end) - window_start)
+                                          for start, end in merged
+                                          if start < window_end and end > window_start])
+                    fragments.append({"start": window_start, "end": window_end,
+                                      "text": text[window_start:window_end], "spans": local})
+            elif text:
+                end = min(len(text), 2 * context + 1)
+                fragments.append({"start": 0, "end": end, "text": text[:end], "spans": []})
+            results.append({"id": doc_id, "fragments": fragments})
+        return results
+
     def rank(self, terms: list[str]) -> list[dict]:
         """Score documents against ``terms`` with a tf-idf sum, best first."""
         _require_terms(terms, "rank")
