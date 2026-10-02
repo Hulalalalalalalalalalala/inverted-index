@@ -29,6 +29,16 @@ def tokenize(text: str) -> list[str]:
     return [match.group(0).lower() for match in TOKEN.finditer(text)]
 
 
+def _token_spans(text: str) -> list[tuple[str, int, int]]:
+    """Like :func:`tokenize` but keeping each token's ``[start, end)`` offsets.
+
+    Offsets count Unicode code points from zero, not UTF-8 bytes or UTF-16
+    units; Python string indices already work that way.
+    """
+    return [(match.group(0).lower(), match.start(), match.end())
+            for match in TOKEN.finditer(text)]
+
+
 def _compile_pattern(pattern: str):
     """Validate a wildcard pattern and return a full-match predicate over terms.
 
@@ -283,6 +293,102 @@ def _evaluate_search(tree, documents: dict[str, str], postings: dict[str, dict])
         return universe - evaluate(node[1])
 
     return evaluate(tree)
+
+
+def _merge_spans(spans: list[tuple[int, int]]) -> list[list[int]]:
+    """Sort, de-duplicate and merge overlapping or touching ``[start, end)`` spans."""
+    merged: list[list[int]] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            if end > merged[-1][1]:
+                merged[-1][1] = end
+        else:
+            merged.append([start, end])
+    return merged
+
+
+def _highlight_search(tree, documents: dict[str, str], postings: dict[str, dict]) -> list[dict]:
+    """Evaluate a parsed tree like :func:`_evaluate_search`, collecting char spans.
+
+    Returns one ``{"id", "text", "spans"}`` item per matching document, sorted
+    by id; ``spans`` are merged ``[start, end)`` code-point offsets. NOT nodes
+    filter but never contribute spans (double negation does not restore them).
+    """
+    universe = set(documents)
+    wildcard_cache: dict[object, set[str]] = {}
+
+    def expanded_terms(pattern: str) -> list[str]:
+        if pattern not in wildcard_cache:
+            matcher = _compile_pattern(pattern)
+            wildcard_cache[pattern] = {term for term in postings if matcher(term)}
+        return wildcard_cache[pattern]
+
+    def evaluate(node, spans: dict[str, list[tuple[int, int]]]) -> set[str]:
+        kind = node[0]
+        if kind == "TERM":
+            term = node[1]
+            hits = set(postings.get(term, {}))
+            for doc_id in hits:
+                for token, start, end in _token_spans(documents[doc_id]):
+                    if token == term:
+                        spans[doc_id].append((start, end))
+            return hits
+        if kind == "WILDCARD":
+            terms = expanded_terms(node[1])
+            hits = {doc_id for term in terms for doc_id in postings.get(term, {})}
+            for doc_id in hits:
+                for token, start, end in _token_spans(documents[doc_id]):
+                    if token in terms:
+                        spans[doc_id].append((start, end))
+            return hits
+        if kind == "PHRASE":
+            phrase_tokens = node[1]
+            hits = set()
+            for doc_id, text in documents.items():
+                tokens = _token_spans(text)
+                for start_index in _sequence_starts([token for token, _, _ in tokens], phrase_tokens):
+                    hits.add(doc_id)
+                    spans[doc_id].append((tokens[start_index][1],
+                                          tokens[start_index + len(phrase_tokens) - 1][2]))
+            return hits
+        if kind == "NEAR":
+            left, right, max_gap = node[1]
+            left_length, right_length = len(left), len(right)
+            hits = set()
+            for doc_id, text in documents.items():
+                tokens = _token_spans(text)
+                sequence = [token for token, _, _ in tokens]
+                for left_start in _sequence_starts(sequence, left):
+                    left_end = left_start + left_length
+                    for right_start in _sequence_starts(sequence, right):
+                        right_end = right_start + right_length
+                        if right_start >= left_end and right_start - left_end <= max_gap:
+                            ordered = ((left_start, left_end), (right_start, right_end))
+                        elif left_start >= right_end and left_start - right_end <= max_gap:
+                            ordered = ((right_start, right_end), (left_start, left_end))
+                        else:
+                            continue
+                        hits.add(doc_id)
+                        first, second = ordered
+                        spans[doc_id].append((tokens[first[0]][1], tokens[first[1] - 1][2]))
+                        spans[doc_id].append((tokens[second[0]][1], tokens[second[1] - 1][2]))
+            return hits
+        if kind == "AND":
+            return evaluate(node[1], spans) & evaluate(node[2], spans)
+        if kind == "OR":
+            left_hits = evaluate(node[1], spans)
+            right_hits = evaluate(node[2], spans)
+            return left_hits | right_hits
+        # NOT: filter only -- the subtree collects no spans.
+        return universe - evaluate(node[1], {doc_id: [] for doc_id in universe})
+
+    collected: dict[str, list[tuple[int, int]]] = {doc_id: [] for doc_id in documents}
+    hits = evaluate(tree, collected)
+    results = []
+    for doc_id in sorted(hits):
+        results.append({"id": doc_id, "text": documents[doc_id],
+                        "spans": _merge_spans(collected[doc_id])})
+    return results
 
 
 class InvertedIndex:
@@ -562,6 +668,33 @@ class InvertedIndex:
         tree = _parse_search(_lex_search(expression))
         snapshot = self._read()
         return sorted(_evaluate_search(tree, snapshot["documents"], snapshot["postings"]))
+
+    def highlight(self, expression: str) -> list[dict]:
+        """Run :meth:`search` and additionally return the matched text spans.
+
+        The expression uses the full :meth:`search` syntax and filtering
+        semantics and returns exactly the same documents, sorted by id. Each
+        item is ``{"id", "text", "spans"}`` with the stored verbatim text and
+        ``spans`` a list of ``[start, end)`` pairs counted in Unicode code
+        points from zero. Plain terms cover every occurrence of the term,
+        wildcard conditions every occurrence of each expanded term, phrases
+        the whole range from the first token's start to the last token's end
+        (punctuation and whitespace between them included), and NEAR covers
+        both fragments of every satisfying pair -- never the gap between
+        them. AND collects both sides, OR only the branches that match the
+        document, and NOT only filters (its subtree yields no spans, even
+        under double negation), so a document matched solely by negation is
+        returned with empty spans. Collected spans are de-duplicated and
+        overlapping or touching spans merged. Read-only; a non-string,
+        blank or otherwise malformed expression raises ``ValueError`` before
+        the snapshot is touched, so the expression is validated even for an
+        empty index; a valid expression with no hits returns an empty list.
+        """
+        if not isinstance(expression, str):
+            raise ValueError("expression must be a string")
+        tree = _parse_search(_lex_search(expression))
+        snapshot = self._read()
+        return _highlight_search(tree, snapshot["documents"], snapshot["postings"])
 
     def rank(self, terms: list[str]) -> list[dict]:
         """Score documents against ``terms`` with a tf-idf sum, best first."""

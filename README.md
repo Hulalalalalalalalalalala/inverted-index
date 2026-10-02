@@ -14,7 +14,7 @@
 python3 -m inverted_index --root ./state init
 ```
 
-子命令：`init`、`add <doc_id> <text>`、`get <doc_id>`、`update <doc_id> <text>`、`delete <doc_id>`、`apply <operations>`、`query <term> [term ...]`、`rank <term> [term ...]`、`bm25 <term> [term ...] [--filter <expression>] [--k1 <float>] [--b <float>]`、`phrase <text>`、`near <left> <right> <max_gap>`、`search <expression>`、`expand <pattern>`、`terms`、`stats`、`reload`、`report`。`apply` 的参数是一个 JSON 数组文本，成功时标准输出一个 JSON 数组；`expand` 成功时把匹配词项列表以 JSON 数组写到标准输出。
+子命令：`init`、`add <doc_id> <text>`、`get <doc_id>`、`update <doc_id> <text>`、`delete <doc_id>`、`apply <operations>`、`query <term> [term ...]`、`rank <term> [term ...]`、`bm25 <term> [term ...] [--filter <expression>] [--k1 <float>] [--b <float>]`、`phrase <text>`、`near <left> <right> <max_gap>`、`search <expression>`、`highlight <expression>`、`expand <pattern>`、`terms`、`stats`、`reload`、`report`。`apply` 的参数是一个 JSON 数组文本，成功时标准输出一个 JSON 数组；`expand` 成功时把匹配词项列表以 JSON 数组写到标准输出。
 
 ## 公开接口
 
@@ -32,6 +32,7 @@ python3 -m inverted_index --root ./state init
 - `phrase(text) -> list[dict]` 精确短语检索：返回 `{id, positions}`，按文档 id 升序；positions 是短语首个词项在文档词项序列中的从 0 开始位置，升序，重复出现保留多个位置。
 - `near(left, right, max_gap) -> list[dict]` 相邻短语近邻检索：两片段按现有 `tokenize` 语义分词，`max_gap` 为非负整数，限定两片段间严格夹着的词项数上限；两片段可任意先后出现，各自连续且不重叠。返回 `{id, occurrences}`，按文档 id 升序；occurrences 为 `[left_start, right_start]` 对（right 先出现时字段仍按左右对应），按 `(left_start, right_start)` 升序，重复位置组合全部保留，未命中文档不出现。任一片段分词后为空，或 `max_gap` 为布尔值、负数、非整数时抛出 `ValueError`。
 - `search(expression) -> list[str]` 组合检索：表达式是单个字符串，由普通词项（连续 ASCII 字母、数字、下划线，按现有规则转小写）、通配词项（未被双引号包裹且含 `*` 或 `?` 的连续片段，`*` 匹配零个或多个字符、`?` 匹配恰好一个字符，必须含至少一个字面字符，命中至少一个展开词项所在的文档）、双引号短语（沿用 `phrase` 的连续词序语义，短语内仍用 `tokenize`，星号问号不作通配符）、近邻原子条件 `NEAR("left","right",distance)`（两片段必须各自以双引号包裹且分词后非空，沿用 `near` 的分词与距离口径：各自连续出现且互不重叠，允许任意先后，严格夹在两段之间的词项数不大于 distance 即命中；distance 为 0 到 2147483647 的 ASCII 十进制整数，允许前导零；片段内逗号与括号属于文本，双引号不可嵌入或转义，星号问号不展开；函数名只接受大写 `NEAR`，名称与 `(` 之间、括号内参数周围与逗号两侧允许空白；不带括号的独立 `NEAR` 仍按普通词项处理）、括号和大小写敏感的 `AND`、`OR`、`NOT` 组成；`NOT` 优先于 `AND`，`AND` 优先于 `OR`，同层从左到右结合。词项命中包含该词项的文档，短语命中包含该连续词序的文档，`AND`/`OR` 取两侧集合的交/并，`NOT` 以当前索引全部文档（含无词项文档）为全集取补。返回按文档 id 升序的字符串列表（同一文档即使多处命中也只出现一次），无命中返回空列表；查询只读快照，不改写 `index.json`。非字符串、NEAR 片段未加双引号或分词后为空、参数数目错误、距离不符合 0..2147483647 的 ASCII 十进制整数规则、分隔符缺失、括号或引号未闭合、空表达式、括号不配对、缺少操作数、操作数之间缺少 `AND`/`OR`、`NOT` 后无操作数、连续运算符、空的双引号短语、短语分词后为空、通配词项没有字面字符以及不支持的字符均抛出 `ValueError`；即使索引为空也先校验表达式。
+- `highlight(expression) -> list[dict]` 原文高亮定位：沿用 `search` 的完整语法与筛选语义，返回与 `search` 相同的文档集合（按文档 id 升序）。每项为 `{id, text, spans}`：`text` 是保存的完整原文（不改大小写、空白与标点），`spans` 是 `[start, end]` 对数组，位置按原文 Unicode 码点从 0 计数、含 start 不含 end（不按 UTF-8 字节或 UTF-16 单元计数）。普通词项标出该词项每次出现的完整词项；通配条件标出每个展开词项的全部出现；短语标出每次连续匹配从首词开头到末词结尾的整个区间（中间原文的标点与空白保留在内）；NEAR 标出所有满足现有距离与非重叠规则的片段组合中的左右两个片段，各占一个区间，片段之间的间隔不纳入高亮；匹配口径沿用现有分词与大小写规则。`AND` 整体成立时收集两侧区间，`OR` 只收集在该文档中成立的分支，`NOT` 只参与筛选、其内部不产生区间（双重否定也不恢复高亮），因此仅靠否定条件命中的文档返回原文但 `spans` 为空。收集结果去重，重叠或首尾相接的区间合并，最终按起点升序输出。只读快照，不改写 `index.json`，旧快照可直接读取；非字符串、空白表达式及其他非法语法统一抛出 `ValueError`，即使索引为空也先校验表达式，合法表达式无命中返回空数组。
 - `expand(pattern) -> list[str]` 通配展开：返回索引中所有匹配 `pattern` 的词项，按 Unicode 码点升序且去重，无匹配返回空列表；`pattern` 按现有词项规则转小写，只允许 ASCII 字母、数字、下划线和通配符 `*`、`?`。空模式、非字符串模式或含非法字符抛出 `ValueError`；只读快照，不改写 `index.json`。
 - `terms() -> list[str]` 升序返回全部词项。
 - `stats() -> dict` 返回文档数、词项数与倒排项数。
