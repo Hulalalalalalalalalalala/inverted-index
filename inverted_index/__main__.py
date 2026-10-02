@@ -79,6 +79,10 @@ def _parser() -> argparse.ArgumentParser:
                           help="maximum number of fragments per document (positive integer)")
     expand = sub.add_parser("expand", help="list every term matching a wildcard pattern")
     expand.add_argument("pattern")
+    fuzzy = sub.add_parser("fuzzy", help="list every term within an edit distance of a term")
+    fuzzy.add_argument("term")
+    fuzzy.add_argument("--max-distance", dest="max_distance", type=int, default=1,
+                       help="maximum Levenshtein edit distance (integer 0..2, default 1)")
     sub.add_parser("terms", help="list every term")
     sub.add_parser("stats", help="print document, term and posting counts")
     sub.add_parser("reload", help="reload the index snapshot")
@@ -122,6 +126,8 @@ def main(argv: list[str] | None = None) -> int:
                              ensure_ascii=False))
         elif args.command == "expand":
             print(json.dumps(index.expand(args.pattern), ensure_ascii=False))
+        elif args.command == "fuzzy":
+            print(json.dumps(index.fuzzy(args.term, args.max_distance), ensure_ascii=False))
         elif args.command == "terms":
             print(json.dumps(index.terms()))
         elif args.command == "stats":
