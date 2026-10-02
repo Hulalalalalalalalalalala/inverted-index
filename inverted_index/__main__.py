@@ -63,11 +63,15 @@ def _parser() -> argparse.ArgumentParser:
     bm25.add_argument("--k1", type=float, default=1.2, help="BM25 k1 (finite positive number)")
     bm25.add_argument("--b", type=float, default=0.75, help="BM25 b (a number within [0, 1])")
     phrase = sub.add_parser("phrase", help="find documents containing an exact token sequence"); phrase.add_argument("text")
+    sloppy_phrase = sub.add_parser("sloppy-phrase", help="find documents containing an ordered token sequence with up to --slop tokens between")
+    sloppy_phrase.add_argument("text")
+    sloppy_phrase.add_argument("--slop", type=int, default=0,
+                              help="maximum number of tokens strictly between consecutive query terms (integer 0..2147483647, default 0)")
     near = sub.add_parser("near", help="find documents where two token fragments occur close together")
     near.add_argument("left")
     near.add_argument("right")
     near.add_argument("max_gap", type=int, help="maximum number of tokens strictly between the fragments")
-    search = sub.add_parser("search", help="evaluate a boolean expression of terms, wildcards, quoted phrases, NEAR(...) conditions, AND, OR, NOT")
+    search = sub.add_parser("search", help="evaluate a boolean expression of terms, wildcards, quoted phrases, NEAR(...)/FUZZY(...)/SLOP(...) conditions, AND, OR, NOT")
     search.add_argument("expression")
     highlight = sub.add_parser("highlight", help="like search, returning the matched text spans in each document")
     highlight.add_argument("expression")
@@ -115,6 +119,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(index.bm25(args.terms, args.expression, args.k1, args.b), ensure_ascii=False))
         elif args.command == "phrase":
             print(json.dumps(index.phrase(args.text), ensure_ascii=False))
+        elif args.command == "sloppy-phrase":
+            print(json.dumps(index.sloppy_phrase(args.text, args.slop), ensure_ascii=False))
         elif args.command == "near":
             print(json.dumps(index.near(args.left, args.right, args.max_gap), ensure_ascii=False))
         elif args.command == "search":

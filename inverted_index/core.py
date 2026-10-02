@@ -122,8 +122,10 @@ def _sequence_starts(sequence: list[str], fragment: list[str]) -> list[int]:
 _SEARCH_OPERATORS = ("AND", "OR", "NOT")
 _NEAR_NAME = "NEAR"
 _FUZZY_NAME = "FUZZY"
+_SLOP_NAME = "SLOP"
 _ASCII_DIGITS = frozenset("0123456789")
 _NEAR_MAX_GAP = 2147483647
+_SLOP_MAX_GAP = 2147483647
 _FUZZY_MAX_DISTANCE = 2
 _FUZZY_TERM_CHARS = re.compile(r"[0-9A-Za-z_]+\Z")
 
@@ -260,15 +262,56 @@ def _lex_fuzzy_call(expression: str, position: int) -> tuple[tuple[str, object],
     return ("FUZZY", (term, distance)), position + 1
 
 
+def _lex_slop_call(expression: str, position: int) -> tuple[tuple[str, object], int]:
+    """Lex a ``SLOP("phrase", distance)`` call; ``position`` is at ``(``.
+
+    The phrase must be double-quoted; punctuation inside the quotes is
+    tokenised as ordinary text and double quotes cannot be embedded or
+    escaped. The raw text is tokenised with the usual :func:`tokenize` rules
+    (wildcards not expanded) and must yield at least one token. The slop is
+    an ASCII decimal integer from 0 to 2147483647, leading zeros allowed.
+    Exactly two arguments.
+    """
+    position = _skip_spaces(expression, position + 1)
+    if position >= len(expression) or expression[position] != '"':
+        raise ValueError("SLOP phrase must be double-quoted")
+    end = expression.find('"', position + 1)
+    if end == -1:
+        raise ValueError("unclosed double quote in search expression")
+    phrase_tokens = tokenize(expression[position + 1:end])
+    if not phrase_tokens:
+        raise ValueError("SLOP phrase needs at least one token")
+    position = _skip_spaces(expression, end + 1)
+    if position >= len(expression) or expression[position] != ",":
+        raise ValueError("SLOP needs exactly two arguments")
+    position = _skip_spaces(expression, position + 1)
+    digits_start = position
+    while position < len(expression) and expression[position] in _ASCII_DIGITS:
+        position += 1
+    if position == digits_start:
+        raise ValueError("SLOP distance must be an ASCII decimal integer")
+    distance = int(expression[digits_start:position])
+    if distance > _SLOP_MAX_GAP:
+        raise ValueError("SLOP distance must be within 0..2147483647")
+    position = _skip_spaces(expression, position)
+    if position < len(expression) and expression[position] == ",":
+        raise ValueError("SLOP needs exactly two arguments")
+    if position >= len(expression) or expression[position] != ")":
+        raise ValueError("unbalanced parentheses in search expression")
+    return ("SLOP", (phrase_tokens, distance)), position + 1
+
+
 def _lex_search(expression: str) -> list[tuple[str, object]]:
     """Split a search expression into ``(kind, value)`` tokens.
 
     Kinds are ``TERM`` (value the lower-cased term), ``WILDCARD`` (value the
     lower-cased pattern), ``PHRASE`` (value the tokenised phrase), ``NEAR``
     (value ``(left_tokens, right_tokens, max_gap)``), ``FUZZY`` (value
-    ``(term, max_distance)``), ``LPAREN``, ``RPAREN``
+    ``(term, max_distance)``), ``SLOP`` (value ``(phrase_tokens, slop)``),
+    ``LPAREN``, ``RPAREN``
     and the operators themselves. Operators are case-sensitive; a bare
-    ``NEAR`` or ``FUZZY`` not directly followed by ``(`` is an ordinary term.
+    ``NEAR``, ``FUZZY`` or ``SLOP`` not directly followed by ``(`` is an
+    ordinary term.
     Anything outside terms, wildcards, quotes, parentheses and whitespace is
     rejected. A wildcard fragment needs at least one literal character.
     """
@@ -308,6 +351,12 @@ def _lex_search(expression: str) -> list[tuple[str, object]]:
                 probe = _skip_spaces(expression, match.end())
                 if probe < len(expression) and expression[probe] == "(":
                     token, position = _lex_fuzzy_call(expression, probe)
+                    tokens.append(token)
+                    continue
+            if word == _SLOP_NAME:
+                probe = _skip_spaces(expression, match.end())
+                if probe < len(expression) and expression[probe] == "(":
+                    token, position = _lex_slop_call(expression, probe)
                     tokens.append(token)
                     continue
             if word in _SEARCH_OPERATORS:
@@ -372,6 +421,8 @@ def _parse_search_primary(tokens, position):
         return ("NEAR", value), position + 1
     if kind == "FUZZY":
         return ("FUZZY", value), position + 1
+    if kind == "SLOP":
+        return ("SLOP", value), position + 1
     if kind == "LPAREN":
         node, position = _parse_search_or(tokens, position + 1)
         if position >= len(tokens) or tokens[position][0] != "RPAREN":
@@ -400,6 +451,43 @@ def _near_match(sequence: list[str], left: list[str], right: list[str], max_gap:
     return False
 
 
+def _validate_slop(slop: object) -> int:
+    """Validate an ordered-phrase slop: an integer within 0..2147483647, booleans rejected."""
+    if isinstance(slop, bool) or not isinstance(slop, int) or not 0 <= slop <= _SLOP_MAX_GAP:
+        raise ValueError("slop must be an integer within 0..2147483647")
+    return slop
+
+
+def _sloppy_matches(sequence: list[str], wanted: list[str], slop: int) -> list[list[int]]:
+    """All ordered sloppy-phrase occurrences of ``wanted`` in ``sequence``.
+
+    Each occurrence is the strictly increasing list of 0-based token
+    positions holding the query terms in their original order (repeated
+    terms occupy distinct positions). Between two consecutive matched
+    positions the number of tokens strictly in between is at most ``slop``;
+    combinations sharing a start and overlapping combinations are all kept.
+    For a single-term query every occurrence yields a one-element list, and
+    at slop 0 the positions are exactly the consecutive phrase starts. The
+    returned lists are deduplicated and sorted lexicographically.
+    """
+    occurrences: set[tuple[int, ...]] = set()
+    stack: list[tuple[int, int, tuple[int, ...]]] = [(0, 0, ())]
+    while stack:
+        index, search_from, positions = stack.pop()
+        term = wanted[index]
+        for position in range(search_from, len(sequence)):
+            if sequence[position] != term:
+                continue
+            if positions and position - positions[-1] - 1 > slop:
+                break
+            updated = positions + (position,)
+            if index + 1 == len(wanted):
+                occurrences.add(updated)
+            else:
+                stack.append((index + 1, position + 1, updated))
+    return [list(match) for match in sorted(occurrences)]
+
+
 def _evaluate_search(tree, documents: dict[str, str], postings: dict[str, dict]) -> set[str]:
     """Evaluate a parsed search tree against a snapshot, returning matching doc ids."""
     universe = set(documents)
@@ -419,6 +507,10 @@ def _evaluate_search(tree, documents: dict[str, str], postings: dict[str, dict])
             left, right, max_gap = node[1]
             return {doc_id for doc_id, text in documents.items()
                     if _near_match(tokenize(text), left, right, max_gap)}
+        if kind == "SLOP":
+            wanted, slop = node[1]
+            return {doc_id for doc_id, text in documents.items()
+                    if _sloppy_matches(tokenize(text), wanted, slop)}
         if kind == "FUZZY":
             term, max_distance = node[1]
             return {doc_id for candidate, entries in postings.items()
@@ -462,9 +554,12 @@ def _evaluate_highlight(tree, words: list[str], bounds: list[tuple[int, int]],
     matched node also yields the spans that actually participate: every term
     or expanded-wildcard occurrence, each phrase match from the first token's
     start to the last token's end, both fragments of every NEAR pair that
-    satisfies the gap and non-overlap rules, and every occurrence of every
-    term within a FUZZY condition's edit distance. NOT only filters -- it never
-    yields spans, so a double negation matches without restoring highlights.
+    satisfies the gap and non-overlap rules, every occurrence of every term
+    within a FUZZY condition's edit distance, and each ordered SLOP match as
+    one span from its first token's start to its last token's end (including
+    every token, punctuation and whitespace in between). NOT only filters --
+    it never yields spans, so a double negation matches without restoring
+    highlights.
     """
 
     def char_span(token_start: int, token_end: int) -> tuple[int, int]:
@@ -510,6 +605,11 @@ def _evaluate_highlight(tree, words: list[str], bounds: list[tuple[int, int]],
             term, max_distance = node[1]
             spans = [bounds[index] for index, token in enumerate(words)
                      if _levenshtein(term, token, max_distance) <= max_distance]
+            return bool(spans), spans
+        if kind == "SLOP":
+            wanted, slop = node[1]
+            matches = _sloppy_matches(words, wanted, slop)
+            spans = [char_span(match[0], match[-1] + 1) for match in matches]
             return bool(spans), spans
         if kind == "AND":
             left_match, left_spans = evaluate(node[1])
@@ -745,6 +845,37 @@ class InvertedIndex:
                 results.append({"id": doc_id, "positions": positions})
         return results
 
+    def sloppy_phrase(self, text: str, slop: int = 0) -> list[dict]:
+        """Find ordered, in-order phrase matches with up to ``slop`` tokens between.
+
+        The query text follows :func:`tokenize` rules (wildcards are not
+        expanded) and the query terms must match strictly increasing, 0-based
+        token positions in their original order; repeated terms occupy
+        distinct positions. The number of tokens strictly between two
+        consecutive matched positions is at most ``slop``. Returns
+        ``[{"id": doc_id, "occurrences": [[pos, ...], ...]}, ...]`` sorted by
+        document id; occurrences hold every matching position list,
+        deduplicated and sorted lexicographically. Combinations sharing a
+        start as well as overlapping combinations are all kept; a single-term
+        query yields one one-element list per occurrence, and at slop 0 the
+        matched documents are exactly those of :meth:`phrase`. ``slop`` must
+        be an integer from 0 to 2147483647 (booleans rejected); a non-string
+        ``text`` or one that tokenises empty raises ``ValueError``, all before
+        the snapshot is read.
+        """
+        tokens = tokenize(text)
+        limit = _validate_slop(slop)
+        if not tokens:
+            raise ValueError("sloppy_phrase needs at least one token")
+        documents = self._read()["documents"]
+        results = []
+        for doc_id in sorted(documents):
+            sequence = tokenize(documents[doc_id])
+            occurrences = _sloppy_matches(sequence, tokens, limit)
+            if occurrences:
+                results.append({"id": doc_id, "occurrences": occurrences})
+        return results
+
     def near(self, left: str, right: str, max_gap: int) -> list[dict]:
         """Find documents where the token sequences of ``left`` and ``right`` are close.
 
@@ -809,7 +940,17 @@ class InvertedIndex:
         from 0 to 2, leading zeros allowed; the function name only accepts
         upper-case ``FUZZY``, whitespace is allowed between the name and the
         parenthesis and around the arguments, and a bare ``FUZZY`` without a
-        following parenthesis is still an ordinary term.
+        following parenthesis is still an ordinary term. A
+        ``SLOP("phrase", slop)`` condition hits documents where the quoted
+        text's tokens (tokenised with ``tokenize`` semantics, punctuation
+        inside the quotes treated as text, wildcards not expanded) match
+        strictly increasing positions in their original order with at most
+        ``slop`` tokens strictly between consecutive matched positions; slop
+        is an ASCII decimal integer from 0 to 2147483647, leading zeros
+        allowed, exactly two arguments are accepted, only upper-case ``SLOP``
+        is a function name (whitespace allowed around the name and
+        arguments), and a bare ``SLOP`` without a following parenthesis is
+        still an ordinary term.
         AND/OR intersect/union the two sides and NOT complements against every
         document in the index. Returns the matching document ids sorted
         ascending; the index is only read, never written. Malformed
@@ -836,7 +977,10 @@ class InvertedIndex:
         fragments of every fragment pair satisfying the existing gap and
         non-overlap rules -- never the gap between them -- and a FUZZY
         condition every occurrence of every expanded term within the edit
-        distance. AND collects both
+        distance, and a SLOP condition the whole original-text interval of
+        every ordered match, from the first term's start through the last
+        term's end (including the intervening terms, punctuation and
+        whitespace). AND collects both
         sides, OR only the branches that hold in the document, NOT only
         filters (its interior yields no spans and double negation does not
         restore them), so a document matched solely through a negation still
