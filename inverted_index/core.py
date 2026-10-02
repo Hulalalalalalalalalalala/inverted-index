@@ -61,6 +61,57 @@ def _require_terms(terms: object, name: str) -> None:
         raise ValueError(f"{name} needs non-empty string terms")
 
 
+def _validate_bm25_k1(k1: object) -> None:
+    """Validate BM25 ``k1``: int/float, booleans rejected, positive and finite.
+
+    Floats must be finite positive numbers; arbitrarily large positive
+    Python ints are also accepted (they never round-trip through float here,
+    so no ``OverflowError`` escapes).
+    """
+    if isinstance(k1, bool) or not isinstance(k1, (int, float)):
+        raise ValueError("k1 must be a finite positive number")
+    if isinstance(k1, int):
+        if k1 <= 0:
+            raise ValueError("k1 must be a finite positive number")
+    elif not math.isfinite(k1) or k1 <= 0:
+        raise ValueError("k1 must be a finite positive number")
+
+
+def _validate_bm25_b(b: object) -> None:
+    """Validate BM25 ``b``: int/float, booleans rejected, finite and in [0, 1].
+
+    Only the integers 0 and 1 pass the integer path; out-of-range giant
+    integers raise ``ValueError`` rather than overflowing inside ``float``.
+    """
+    if isinstance(b, bool) or not isinstance(b, (int, float)):
+        raise ValueError("b must be a finite number within [0, 1]")
+    if isinstance(b, int):
+        if not 0 <= b <= 1:
+            raise ValueError("b must be a finite number within [0, 1]")
+    elif not math.isfinite(b) or not 0 <= b <= 1:
+        raise ValueError("b must be a finite number within [0, 1]")
+
+
+def _bm25_term_ratio(tf: int, k1: float, length_norm: float) -> float:
+    """Return ``(k1 + 1) / (tf + k1 * length_norm)`` without float overflow.
+
+    ``k1`` is a non-negative float; a value beyond the float range (from a
+    huge Python int argument) is mapped to infinity by the caller and the
+    ratio becomes ``1 / length_norm``. For finite ``k1 >= 1`` numerator and
+    denominator are divided by ``k1`` first (both stay at most
+    ``max(2, tf)``), so a large ``k1`` can never make the denominator
+    infinity; for ``0 < k1 < 1`` the direct form is used -- the numerator is
+    then at most 2 and ``k1 * length_norm`` stays at the length norm's
+    scale, so tiny subnormal ``k1`` keeps its exact ordinary-form score.
+    """
+    if math.isinf(k1):
+        return 1.0 / length_norm
+    if k1 >= 1.0:
+        inv_k1 = 1.0 / k1
+        return (1.0 + inv_k1) / (length_norm + tf * inv_k1)
+    return (1.0 + k1) / (tf + k1 * length_norm)
+
+
 def _sequence_starts(sequence: list[str], fragment: list[str]) -> list[int]:
     """All 0-based starts where ``fragment`` occurs consecutively in ``sequence``."""
     length = len(fragment)
@@ -915,23 +966,31 @@ class InvertedIndex:
         returned. Every returned document matches at least one term and the
         filter; items are ``{"id", "matched", "score"}`` with ``matched`` the
         number of distinct matched terms, sorted by rounded score descending
-        then id ascending. Read-only; raises ``ValueError`` for bad terms,
-        ``k1``/``b`` or an invalid expression, even when nothing could match.
+        then id ascending. Scores are always finite: arithmetic is scaled so
+        even ``k1`` near ``float('inf')`` (or a positive int beyond the float
+        range, e.g. ``10 ** 1000``) yields the limiting score rather than
+        infinity. Read-only; raises ``ValueError`` for bad terms, ``k1``/``b``
+        or an invalid expression, even when nothing could match.
         """
         if not isinstance(terms, list) or not terms:
             raise ValueError("bm25 needs a non-empty list of terms")
         if any(not isinstance(term, str) or not term for term in terms):
             raise ValueError("bm25 terms must be non-empty strings")
-        if isinstance(k1, bool) or not isinstance(k1, (int, float)) or not math.isfinite(k1) or k1 <= 0:
-            raise ValueError("k1 must be a finite positive number")
-        if isinstance(b, bool) or not isinstance(b, (int, float)) or not math.isfinite(b) or not 0 <= b <= 1:
-            raise ValueError("b must be a finite number within [0, 1]")
+        _validate_bm25_k1(k1)
+        _validate_bm25_b(b)
         tree = None
         if expression is not None:
             if not isinstance(expression, str):
                 raise ValueError("expression must be a string or None")
             tree = _parse_search(_lex_search(expression))
         wanted = list(dict.fromkeys(term.lower() for term in terms))
+        # A giant Python int overflows float conversion; map it to +inf.
+        # Arithmetic below never multiplies by the raw int, so no
+        # OverflowError can escape.
+        try:
+            k1_float = float(k1)
+        except OverflowError:
+            k1_float = math.inf
         snapshot = self._read()
         documents = snapshot["documents"]
         postings = snapshot["postings"]
@@ -952,9 +1011,8 @@ class InvertedIndex:
             for doc_id, tf in entries.items():
                 if candidates is not None and doc_id not in candidates:
                     continue
-                dl = lengths[doc_id]
-                denominator = tf + k1 * (1 - b + b * dl / avgdl)
-                contribution = idf * tf * (k1 + 1) / denominator
+                length_norm = 1.0 - b + b * lengths[doc_id] / avgdl
+                contribution = idf * tf * _bm25_term_ratio(tf, k1_float, length_norm)
                 hit = scored.setdefault(doc_id, {"matched": 0, "score": 0.0})
                 hit["matched"] += 1
                 hit["score"] += contribution
