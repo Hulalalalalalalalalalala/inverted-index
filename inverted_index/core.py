@@ -285,6 +285,99 @@ def _evaluate_search(tree, documents: dict[str, str], postings: dict[str, dict])
     return evaluate(tree)
 
 
+def _merge_spans(spans: list[tuple[int, int]]) -> list[list[int]]:
+    """Deduplicate half-open ``[start, end)`` spans and merge touching/overlapping ones.
+
+    Spans are Unicode code point offsets; two spans that overlap or abut
+    (``end == next_start``) become one span. Sorted by start ascending.
+    """
+    if not spans:
+        return []
+    ordered = sorted(set(spans))
+    merged: list[list[int]] = [list(ordered[0])]
+    for start, end in ordered[1:]:
+        if start <= merged[-1][1]:
+            if end > merged[-1][1]:
+                merged[-1][1] = end
+        else:
+            merged.append([start, end])
+    return merged
+
+
+def _evaluate_highlight(tree, words: list[str], bounds: list[tuple[int, int]],
+                        matchers: dict[str, object]) -> tuple[bool, list[tuple[int, int]]]:
+    """Evaluate a parsed tree for one document, returning ``(matched, spans)``.
+
+    ``words`` are the document's lower-cased tokens and ``bounds`` their
+    half-open Unicode code point offsets. Matching is identical to
+    :func:`_evaluate_search` (terms come from the same tokenisation), but a
+    matched node also yields the spans that actually participate: every term
+    or expanded-wildcard occurrence, each phrase match from the first token's
+    start to the last token's end, and both fragments of every NEAR pair that
+    satisfies the gap and non-overlap rules. NOT only filters -- it never
+    yields spans, so a double negation matches without restoring highlights.
+    """
+
+    def char_span(token_start: int, token_end: int) -> tuple[int, int]:
+        return bounds[token_start][0], bounds[token_end - 1][1]
+
+    def evaluate(node) -> tuple[bool, list[tuple[int, int]]]:
+        kind = node[0]
+        if kind == "TERM":
+            term = node[1]
+            spans = [bounds[index] for index, token in enumerate(words) if token == term]
+            return bool(spans), spans
+        if kind == "WILDCARD":
+            pattern = node[1]
+            matcher = matchers.get(pattern)
+            if matcher is None:
+                matcher = _compile_pattern(pattern)
+                matchers[pattern] = matcher
+            spans = [bounds[index] for index, token in enumerate(words) if matcher(token)]
+            return bool(spans), spans
+        if kind == "PHRASE":
+            wanted = node[1]
+            spans = [char_span(start, start + len(wanted))
+                     for start in _sequence_starts(words, wanted)]
+            return bool(spans), spans
+        if kind == "NEAR":
+            left, right, max_gap = node[1]
+            spans: set[tuple[int, int]] = set()
+            for left_start in _sequence_starts(words, left):
+                left_end = left_start + len(left)
+                for right_start in _sequence_starts(words, right):
+                    right_end = right_start + len(right)
+                    if right_start >= left_end and right_start - left_end <= max_gap:
+                        pass
+                    elif left_start >= right_end and left_start - right_end <= max_gap:
+                        pass
+                    else:
+                        continue
+                    spans.add(char_span(left_start, left_end))
+                    spans.add(char_span(right_start, right_end))
+            ordered = sorted(spans)
+            return bool(ordered), ordered
+        if kind == "AND":
+            left_match, left_spans = evaluate(node[1])
+            if not left_match:
+                return False, []
+            right_match, right_spans = evaluate(node[2])
+            if not right_match:
+                return False, []
+            return True, left_spans + right_spans
+        if kind == "OR":
+            left_match, left_spans = evaluate(node[1])
+            right_match, right_spans = evaluate(node[2])
+            spans = list(left_spans) if left_match else []
+            if right_match:
+                spans.extend(right_spans)
+            return left_match or right_match, spans
+        matched, _ = evaluate(node[1])
+        return not matched, []
+
+    return evaluate(tree)
+
+
 class InvertedIndex:
     """A single-process inverted index rooted at ``root``."""
 
@@ -562,6 +655,47 @@ class InvertedIndex:
         tree = _parse_search(_lex_search(expression))
         snapshot = self._read()
         return sorted(_evaluate_search(tree, snapshot["documents"], snapshot["postings"]))
+
+    def highlight(self, expression: str) -> list[dict]:
+        """Return matching documents with the text spans that actually matched.
+
+        Uses the same syntax and filtering semantics as :meth:`search`, so the
+        document set is identical; items are sorted by document id and each is
+        ``{"id": doc_id, "text": text, "spans": [[start, end], ...]}`` with the
+        full stored text and half-open ``[start, end)`` offsets counted in
+        Unicode code points from zero. A plain term highlights every
+        occurrence of the complete term, a wildcard every occurrence of every
+        expanded term, a phrase the whole interval of each consecutive match
+        (from the first token's start through the last token's end, keeping the
+        punctuation and whitespace in between), and a NEAR condition both
+        fragments of every fragment pair satisfying the existing gap and
+        non-overlap rules -- never the gap between them. AND collects both
+        sides, OR only the branches that hold in the document, NOT only
+        filters (its interior yields no spans and double negation does not
+        restore them), so a document matched solely through a negation still
+        returns its text with empty spans. Collected spans are deduplicated and
+        overlapping or abutting spans merged, sorted by start. The index is
+        only read, never written. Non-strings, blank or otherwise malformed
+        expressions raise ``ValueError`` before the store is touched, so the
+        expression is validated even on an empty index.
+        """
+        if not isinstance(expression, str) or not expression.strip():
+            raise ValueError("expression must be a non-blank string")
+        tree = _parse_search(_lex_search(expression))
+        snapshot = self._read()
+        documents = snapshot["documents"]
+        postings = snapshot["postings"]
+        matching = _evaluate_search(tree, documents, postings)
+        results: list[dict] = []
+        matchers: dict[str, object] = {}
+        for doc_id in sorted(matching):
+            text = documents[doc_id]
+            matches = list(TOKEN.finditer(text))
+            words = [match.group(0).lower() for match in matches]
+            bounds = [(match.start(), match.end()) for match in matches]
+            _, spans = _evaluate_highlight(tree, words, bounds, matchers)
+            results.append({"id": doc_id, "text": text, "spans": _merge_spans(spans)})
+        return results
 
     def rank(self, terms: list[str]) -> list[dict]:
         """Score documents against ``terms`` with a tf-idf sum, best first."""
